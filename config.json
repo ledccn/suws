@@ -1,0 +1,8 @@
+{
+  "token": "david",
+  "webhook": "https://suws.cn/app/notify",
+  "webhook_timeout": 5,
+  "log": {
+    "verbose": false
+  }
+}

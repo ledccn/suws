@@ -1,0 +1,15 @@
+/.idea
+/.vscode
+/*.log
+/.git
+/vendor
+/composer.lock
+.DS_Store
+*.DS_Store
+/suws-darwin-amd64
+/suws-darwin-arm64
+/suws-linux-amd64
+/suws-linux-arm64
+/suws-windows-amd64.exe
+/*.exe
+/suws
