@@ -173,7 +173,7 @@ const (
 // ErrorMessageMap 错误消息映射
 var ErrorMessageMap = map[int]string{
 	ErrCodeSuccess:                            "成功",
-	ErrCodeInvalidParams:                      "参数错误",
+	ErrCodeInvalidParams:                      "SuWS参数错误",
 	ErrCodeMissingClientID:                    "缺少client_id参数",
 	ErrCodeMissingUID:                         "缺少uid参数",
 	ErrCodeMissingAuth:                        "缺少auth参数",
@@ -891,7 +891,7 @@ func (h *Hub) isUidOnline(uid string) bool {
 }
 
 // sendToUid 向UID绑定的所有在线client_id发送字符串数据
-func (h *Hub) sendToUid(uid string, data string) ResponseInfo {
+func (h *Hub) sendToUid(uid string, body []byte) ResponseInfo {
 	h.uidMapMutex.RLock()
 	clientIDs, ok := h.uidMap[uid]
 	h.uidMapMutex.RUnlock()
@@ -911,7 +911,7 @@ func (h *Hub) sendToUid(uid string, data string) ResponseInfo {
 		}
 
 		select {
-		case client.Send <- []byte(data):
+		case client.Send <- body:
 			sent = true
 		default:
 			// 发送失败，可能是通道已满或连接已关闭
@@ -1107,7 +1107,7 @@ func (h *Hub) handleRPCResponse(uid string, response map[string]interface{}) {
 }
 
 // callRPC 发起RPC调用并等待响应
-func (h *Hub) callRPC(uid string, req RPCRequest) ResponseInfo {
+func (h *Hub) callRPC(uid string, body []byte, req *RPCRequest) ResponseInfo {
 	h.uidMapMutex.RLock()
 	clientIDs, ok := h.uidMap[uid]
 	h.uidMapMutex.RUnlock()
@@ -1116,21 +1116,7 @@ func (h *Hub) callRPC(uid string, req RPCRequest) ResponseInfo {
 	}
 
 	// 构造RPC请求消息
-	message := map[string]interface{}{
-		"_id":     req.ID,
-		"_method": req.Method,
-	}
-
-	if req.Args != nil {
-		message["args"] = req.Args
-	} else {
-		message["args"] = map[string]interface{}{} // 空对象
-	}
-
-	jsonMessage, err := json.Marshal(message)
-	if err != nil {
-		return NewErrorResponse(ErrCodeSerializeRPCFailed)
-	}
+	jsonMessage := body
 
 	// RCP等待通道：唯一KEY = uid + _id + _method
 	rpcKey := fmt.Sprintf("%s_%d_%s", uid, req.ID, req.Method)
@@ -1949,7 +1935,7 @@ func sendToUidHandler(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, hub.sendToUid(uid, string(body)))
+	c.JSON(http.StatusOK, hub.sendToUid(uid, body))
 }
 
 // HTTP处理函数，向UID发送结构化数据
@@ -2039,8 +2025,22 @@ func rpcHandler(c *gin.Context) {
 		return
 	}
 
-	var req RPCRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	// 读取请求体作为字符串
+	body, err := c.GetRawData()
+	if err != nil {
+		resp := NewErrorResponse(ErrCodeReadBodyFailed)
+		c.JSON(http.StatusBadRequest, resp)
+		return
+	}
+
+	if len(body) == 0 {
+		resp := NewErrorResponse(ErrCodeEmptyBody)
+		c.JSON(http.StatusBadRequest, resp)
+		return
+	}
+
+	req := &RPCRequest{}
+	if err := json.Unmarshal(body, req); err != nil {
 		resp := NewErrorResponse(ErrCodeInvalidParams)
 		c.JSON(http.StatusBadRequest, resp)
 		return
@@ -2058,7 +2058,7 @@ func rpcHandler(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, hub.callRPC(uid, req))
+	c.JSON(http.StatusOK, hub.callRPC(uid, body, req))
 }
 
 // HTTP处理函数，根据UID获取所有绑定的在线client_id
