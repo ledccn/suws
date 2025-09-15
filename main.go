@@ -1047,9 +1047,6 @@ func (h *Hub) callRPC(uid string, body []byte, req *RPCRequest) ResponseInfo {
 		return NewErrorResponse(ErrCodeUIDNotOnline)
 	}
 
-	// 构造RPC请求消息
-	jsonMessage := body
-
 	// RCP等待通道：唯一KEY = uid + _id + _method
 	rpcKey := fmt.Sprintf("%s_%d_%s", uid, req.ID, req.Method)
 	rpcChan := make(chan interface{}, 1)
@@ -1075,7 +1072,7 @@ func (h *Hub) callRPC(uid string, body []byte, req *RPCRequest) ResponseInfo {
 		}
 
 		select {
-		case client.Send <- jsonMessage:
+		case client.Send <- body:
 			sent = true
 		default:
 			// 发送失败，可能是通道已满或连接已关闭
@@ -1390,7 +1387,6 @@ func (h *Hub) getGroupByUid(uid string) ResponseInfo {
 		return NewErrorResponse(ErrCodeUIDNotOnline)
 	}
 
-	// 收集该UID所属的所有群组及详细信息
 	groupInfo := make(map[string]map[string]int64)
 
 	// 遍历该UID绑定的所有客户端
