@@ -761,7 +761,7 @@ func (h *Hub) sendToAll(req SendToAllRequest) ResponseInfo {
 }
 
 // sendToClient 向指定client_id发送数据
-func (h *Hub) sendToClient(clientID string, data string) ResponseInfo {
+func (h *Hub) sendToClient(clientID string, body []byte) ResponseInfo {
 	h.clientsMutex.RLock()
 	client, ok := h.clients[clientID]
 	h.clientsMutex.RUnlock()
@@ -770,7 +770,7 @@ func (h *Hub) sendToClient(clientID string, data string) ResponseInfo {
 	}
 
 	select {
-	case client.Send <- []byte(data):
+	case client.Send <- body:
 		return NewSuccessResponse(nil)
 	default:
 		return NewErrorResponse(ErrCodeSendFailed)
@@ -922,74 +922,6 @@ func (h *Hub) sendToUid(uid string, body []byte) ResponseInfo {
 	} else {
 		return NewErrorResponse(ErrCodeSendFailed)
 	}
-}
-
-// sendToUidMessage 向UID绑定的所有在线client_id发送数据
-func (h *Hub) sendToUidMessage(uid string, data interface{}) ResponseInfo {
-	h.uidMapMutex.RLock()
-	clientIDs, ok := h.uidMap[uid]
-	h.uidMapMutex.RUnlock()
-	if !ok || len(clientIDs) == 0 {
-		return NewErrorResponse(ErrCodeUIDNotOnline)
-	}
-
-	// 检查data是否包含特定字段，如果是则直接使用data作为消息
-	var message interface{}
-	if h.hasSpecialFields(data) {
-		message = data
-	} else {
-		message = map[string]interface{}{
-			"event": "message",
-			"data":  data,
-		}
-	}
-
-	jsonMessage, err := json.Marshal(message)
-	if err != nil {
-		return NewErrorResponse(ErrCodeSendSerializeFailed)
-	}
-
-	h.clientsMutex.RLock()
-	defer h.clientsMutex.RUnlock()
-
-	sent := false
-	for _, clientID := range clientIDs {
-		// 检查客户端是否仍然在线
-		client, clientExists := h.clients[clientID]
-		if !clientExists {
-			continue
-		}
-
-		select {
-		case client.Send <- jsonMessage:
-			sent = true
-		default:
-			// 发送失败，可能是通道已满或连接已关闭
-		}
-	}
-	if sent {
-		return NewSuccessResponse(nil)
-	} else {
-		return NewErrorResponse(ErrCodeSendFailed)
-	}
-}
-
-// hasSpecialFields 检查data是否包含特定字段，如果是则直接使用data作为消息
-func (h *Hub) hasSpecialFields(data interface{}) bool {
-	// 尝试将data转换为map[string]interface{}
-	if mData, ok := data.(map[string]interface{}); ok {
-		// 检查是否包含event指定字段
-		if _, hasEvent := mData["event"]; hasEvent {
-			return true
-		}
-		// 检查是否包含_id与_method字段
-		_, hasId := mData["_id"]
-		_, hasMethod := mData["_method"]
-		if hasId && hasMethod {
-			return true
-		}
-	}
-	return false
 }
 
 // getUidSession 获取某个UID对应的session
@@ -1789,7 +1721,7 @@ func sendToClientHandler(c *gin.Context) {
 		return
 	}
 
-	resp := hub.sendToClient(clientID, string(body))
+	resp := hub.sendToClient(clientID, body)
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -1936,21 +1868,6 @@ func sendToUidHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, hub.sendToUid(uid, body))
-}
-
-// HTTP处理函数，向UID发送结构化数据
-func sendToUidMessageHandler(c *gin.Context) {
-	var req struct {
-		UID  string      `json:"uid"`
-		Data interface{} `json:"data"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	c.JSON(http.StatusOK, hub.sendToUidMessage(req.UID, req.Data))
 }
 
 // HTTP处理函数，获取UID的session
@@ -2715,7 +2632,6 @@ func main() {
 		api.POST("/unbindUid", unbindUidHandler)
 		api.GET("/isUidOnline", isUidOnlineHandler)
 		api.POST("/sendToUid", sendToUidHandler)
-		api.POST("/sendToUidMessage", sendToUidMessageHandler) // 【GatewayWorker无此接口】
 		api.GET("/getUidSession", getUidSessionHandler)        // 【GatewayWorker无此接口】
 		api.POST("/setUidSession", setUidSessionHandler)       // 【GatewayWorker无此接口】
 		api.GET("/getClientSession", getClientSessionHandler)  // 别名，功能同 getSession
