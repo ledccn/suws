@@ -40,7 +40,7 @@ type Hub struct {
 	uidMap     map[string][]string               // UID到client_id列表的映射
 	sessions   map[string]map[string]interface{} // UID到Session的映射（用户级Session）
 	groups     map[string]map[string]int64       // 群组名到client_id到毫秒时间戳的映射（群组管理）
-	rpcCalls   map[string]chan interface{}       // RPC调用等待通道映射（唯一key:uid + _id + _method）
+	rpcCalls   map[string]chan interface{}       // RPC调用等待通道映射（唯一key：uid + _id + _method）
 
 	// 细粒度锁
 	clientsMutex  sync.RWMutex // 保护clients映射
@@ -124,6 +124,18 @@ type GroupRequest struct {
 	ClientID string `json:"client_id"` // 客户端ID
 }
 
+// FailedAttempt 记录失败尝试的信息
+type FailedAttempt struct {
+	Count     int       // 失败次数
+	FirstTime time.Time // 第一次失败时间
+}
+
+// AuthLimiter 认证限制器
+type AuthLimiter struct {
+	failedAttempts map[string]*FailedAttempt // IP地址到失败尝试的映射
+	mutex          sync.RWMutex              // 保护failedAttempts的读写锁
+}
+
 // 错误代码常量定义
 const (
 	ErrCodeSuccess                            = 0   // 成功
@@ -168,6 +180,7 @@ const (
 	ErrCodeConfigFileReadFailed               = 138 // 配置文件读取失败
 	ErrCodeConfigFileParseFailed              = 139 // 配置文件解析失败
 	ErrCodeConfigReloadFailed                 = 140 // 配置重载失败
+	ErrCodeInvalidTokenFailedTooMany          = 429 // 认证失败次数过多
 )
 
 // ErrorMessageMap 错误消息映射
@@ -214,6 +227,7 @@ var ErrorMessageMap = map[int]string{
 	ErrCodeConfigFileReadFailed:               "配置文件读取失败",
 	ErrCodeConfigFileParseFailed:              "配置文件解析失败",
 	ErrCodeConfigReloadFailed:                 "配置重载失败",
+	ErrCodeInvalidTokenFailedTooMany:          "认证失败次数过多",
 }
 
 // ResponseInfo 响应信息结构体
@@ -269,11 +283,12 @@ const (
 
 // 全局变量
 var hub *Hub
-var config *Config
+var config *Config                 // 全局配置
 var configMutex sync.RWMutex       // 保护配置的读写锁
 var configPath string              // 配置文件路径
 var startTime time.Time            // 服务启动时间
 var webhookHTTPClient *http.Client // webhook HTTP客户端（带连接池）
+var authLimiter *AuthLimiter       // 认证限制器
 
 // Build variables (set via ldflags)
 var (
@@ -310,7 +325,6 @@ func loadConfig(configPath string) error {
 		return fmt.Errorf("配置文件内 token 为空")
 	}
 
-	// 设置默认值
 	if c.WebhookTimeout == 0 {
 		c.WebhookTimeout = 5
 	}
@@ -328,7 +342,6 @@ func loadConfig(configPath string) error {
 		fmt.Println("WebHook超时时间", c.WebhookTimeout, "秒")
 	}
 
-	// 更新全局配置
 	configMutex.Lock()
 	config = c
 	configMutex.Unlock()
@@ -361,18 +374,15 @@ func (h *Hub) run() {
 
 // heartbeatRoutine 心跳检测独立goroutine
 func (h *Hub) heartbeatRoutine() {
-	// 心跳检测定时器，每 X 秒检查一次心跳
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
-	var heartbeatCounter uint8 // 心跳检测频率计数器
+	var heartbeatCounter uint8
 
 	for {
 		select {
 		case <-ticker.C:
-			// 每 X 秒计数器 +1
 			heartbeatCounter++
-			// 当计数器值大于或等于间隔值时，执行心跳检测逻辑
 			if heartbeatCounter >= h.calculateHeartbeatInterval() {
 				heartbeatCounter = 0
 
@@ -384,7 +394,6 @@ func (h *Hub) heartbeatRoutine() {
 					continue
 				}
 
-				// 收集超时客户端
 				for id, client := range h.clients {
 					client.mutex.RLock()
 					lastPing := client.LastPing
@@ -398,7 +407,6 @@ func (h *Hub) heartbeatRoutine() {
 				}
 				h.clientsMutex.RUnlock()
 
-				// 批量处理超时客户端
 				for _, client := range timeoutClients {
 					h.unregister <- client
 				}
@@ -410,11 +418,9 @@ func (h *Hub) heartbeatRoutine() {
 // unregisterClient 内部注销客户端方法（必须加锁后才能调用）
 func (h *Hub) unregisterClient(client *Client) {
 	if client.UID != "" {
-		// 如果客户端已绑定UID，先解绑
 		h.unbindUidInternal(client)
 	}
 
-	// 从所有群组中移除客户端
 	h.groupsMutex.Lock()
 	for groupName, clients := range h.groups {
 		if _, exists := clients[client.ID]; exists {
@@ -427,13 +433,10 @@ func (h *Hub) unregisterClient(client *Client) {
 	}
 	h.groupsMutex.Unlock()
 
-	// 从clients映射中删除
 	delete(h.clients, client.ID)
 
-	// 关闭发送通道
 	close(client.Send)
 
-	// 关闭WebSocket连接
 	client.Conn.Close()
 }
 
@@ -448,8 +451,6 @@ func (h *Hub) unbindUidInternal(client *Client) {
 
 	clientIDs := h.uidMap[client.UID]
 	remainingClients := make([]string, 0)
-
-	// 找到要移除的client_id并过滤掉
 	for _, id := range clientIDs {
 		if id != client.ID {
 			remainingClients = append(remainingClients, id)
@@ -457,10 +458,9 @@ func (h *Hub) unbindUidInternal(client *Client) {
 	}
 
 	var event = WebhookEventUnbind
-	// 检查是否还有其他客户端连接到这个UID
 	if len(remainingClients) == 0 {
 		event = WebhookEventOffline
-		// 没有其他客户端连接到这个UID，清理UID映射和用户session
+
 		delete(h.uidMap, client.UID)
 
 		h.sessionsMutex.Lock()
@@ -469,12 +469,10 @@ func (h *Hub) unbindUidInternal(client *Client) {
 
 		slog.Debug(fmt.Sprintf("UID %s 已完全离线，清理相关session", client.UID))
 	} else {
-		// 还有其他客户端连接到这个UID，更新映射
 		h.uidMap[client.UID] = remainingClients
 	}
 
-	// 触发webhook
-	h.sendWebhook(client.UID, client.ID, event)
+	sendWebhook(client.UID, client.ID, event)
 
 	client.UID = ""
 }
@@ -495,7 +493,6 @@ func handleWebSocket(c *gin.Context) {
 		return
 	}
 
-	// 生成client_id和auth
 	clientID := uuid.New().String()
 	auth := generateNanoMd5()
 
@@ -508,10 +505,8 @@ func handleWebSocket(c *gin.Context) {
 		Session:  make(map[string]interface{}), // 初始化客户端会话
 	}
 
-	// 注册客户端
 	hub.register <- client
 
-	// 发送初始信息
 	initMsg := map[string]interface{}{
 		"event":     "init",
 		"client_id": clientID,
@@ -521,7 +516,6 @@ func handleWebSocket(c *gin.Context) {
 	jsonInitMsg, _ := json.Marshal(initMsg)
 	client.Send <- jsonInitMsg
 
-	// 启动读写goroutine
 	go client.writePump()
 	go client.readPump()
 }
@@ -546,13 +540,6 @@ func (h *Hub) calculateHeartbeatInterval() uint8 {
 	default:
 		return 6
 	}
-}
-
-// generateNanoMd5 生成auth字符串（纳秒时间戳md5后的32字节小写字符串）
-func generateNanoMd5() string {
-	nanoStr := strconv.FormatInt(time.Now().UnixNano(), 10)
-	hash := md5.Sum([]byte(nanoStr))
-	return hex.EncodeToString(hash[:])
 }
 
 // writePump 处理向客户端写入消息
@@ -601,7 +588,7 @@ func (c *Client) readPump() {
 	}()
 
 	// 1. 限制消息大小
-	c.Conn.SetReadLimit(262144) // 512KB（524288） 或 256KB（262144）
+	c.Conn.SetReadLimit(262144) // 512KB（524288） 或 256KB（262144） 或 128KB（131072）
 	// 2. 设置读取超时
 	err := c.Conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 	if err != nil {
@@ -658,39 +645,16 @@ func (c *Client) updateLastPing() error {
 	c.LastPing = time.Now()
 	c.mutex.Unlock()
 
-	// 重置读取超时
 	err := c.Conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 	if err != nil {
 		return err
 	}
 
-	// 只有当LastPing有实质性更新时才触发webhook
 	if time.Since(oldPing) > 10*time.Second {
-		hub.sendWebhook(c.UID, c.ID, WebhookEventPing)
+		sendWebhook(c.UID, c.ID, WebhookEventPing)
 	}
 
 	return nil
-}
-
-// sendToClients 向指定客户端列表发送消息并返回成功和失败数量
-func (h *Hub) sendToClients(targetClients map[string]*Client, data string) map[string]interface{} {
-	successCount := 0
-	failureCount := 0
-
-	for _, client := range targetClients {
-		select {
-		case client.Send <- []byte(data):
-			successCount++
-		default:
-			// 发送失败，可能是通道已满或连接已关闭
-			failureCount++
-		}
-	}
-
-	return map[string]interface{}{
-		"success": successCount,
-		"failure": failureCount,
-	}
 }
 
 // sendToAll 向所有客户端或指定客户端发送字符串数据
@@ -698,12 +662,10 @@ func (h *Hub) sendToAll(req SendToAllRequest) ResponseInfo {
 	h.clientsMutex.RLock()
 	defer h.clientsMutex.RUnlock()
 
-	// 优化：如果没有任何客户端连接，直接返回
 	if len(h.clients) == 0 {
 		return NewErrorResponse(ErrCodeClientNotFound)
 	}
 
-	// 创建要发送的客户端列表
 	targetClients := make(map[string]*Client)
 
 	// 如果指定了client_ids，则只向这些客户端发送
@@ -714,12 +676,10 @@ func (h *Hub) sendToAll(req SendToAllRequest) ResponseInfo {
 			}
 		}
 
-		// 优化：如果目标客户端为空，直接返回
 		if len(targetClients) == 0 {
 			return NewErrorResponse(ErrCodeSendFailedEmpty)
 		}
 	} else {
-		// 否则向所有客户端发送
 		for clientID, client := range h.clients {
 			targetClients[clientID] = client
 		}
@@ -731,7 +691,6 @@ func (h *Hub) sendToAll(req SendToAllRequest) ResponseInfo {
 			delete(targetClients, clientID)
 		}
 
-		// 优化：如果目标客户端为空，直接返回
 		if len(targetClients) == 0 {
 			return NewErrorResponse(ErrCodeSendFailedEmptyExcludeClients)
 		}
@@ -749,15 +708,12 @@ func (h *Hub) sendToAll(req SendToAllRequest) ResponseInfo {
 		}
 		h.uidMapMutex.RUnlock()
 
-		// 优化：如果目标客户端为空，直接返回
 		if len(targetClients) == 0 {
 			return NewErrorResponse(ErrCodeSendFailedEmptyExcludeUIDs)
 		}
 	}
 
-	// 发送消息并统计成功和失败数量
-	result := h.sendToClients(targetClients, req.Data)
-	return NewSuccessResponse(result)
+	return NewSuccessResponse(sendToClients(targetClients, req.Data))
 }
 
 // sendToClient 向指定client_id发送数据
@@ -792,14 +748,6 @@ func (h *Hub) closeClient(clientID string) bool {
 	return true
 }
 
-// isClientOnline 判断指定client_id是否在线
-func (h *Hub) isClientOnline(clientID string) bool {
-	h.clientsMutex.RLock()
-	_, ok := h.clients[clientID]
-	h.clientsMutex.RUnlock()
-	return ok
-}
-
 // bindUid 将client_id与uid绑定
 func (h *Hub) bindUid(clientID, uid, auth string) ResponseInfo {
 	h.clientsMutex.Lock()
@@ -817,15 +765,12 @@ func (h *Hub) bindUid(clientID, uid, auth string) ResponseInfo {
 
 	if client.UID != "" {
 		if client.UID == uid {
-			// 重复绑定，直接返回
 			return NewSuccessResponse(nil)
 		} else {
-			// 如果客户端已经绑定了其他UID，先解绑
 			h.unbindUidInternal(client)
 		}
 	}
 
-	// 绑定新的UID
 	client.UID = uid
 
 	var event = WebhookEventBind
@@ -837,9 +782,7 @@ func (h *Hub) bindUid(clientID, uid, auth string) ResponseInfo {
 	h.uidMapMutex.Unlock()
 
 	slog.Debug(fmt.Sprintf("客户端 %s 已绑定到UID %s", clientID, uid))
-
-	// 触发webhook
-	h.sendWebhook(uid, clientID, event)
+	sendWebhook(uid, clientID, event)
 
 	return NewSuccessResponse(nil)
 }
@@ -878,7 +821,6 @@ func (h *Hub) isUidOnline(uid string) bool {
 		return false
 	}
 
-	// 检查这些client_id是否仍然有效（客户端仍然在线）
 	h.clientsMutex.RLock()
 	defer h.clientsMutex.RUnlock()
 	for _, clientID := range clientIDs {
@@ -904,7 +846,6 @@ func (h *Hub) sendToUid(uid string, body []byte) ResponseInfo {
 
 	sent := false
 	for _, clientID := range clientIDs {
-		// 检查客户端是否仍然在线
 		client, clientExists := h.clients[clientID]
 		if !clientExists {
 			continue
@@ -914,182 +855,12 @@ func (h *Hub) sendToUid(uid string, body []byte) ResponseInfo {
 		case client.Send <- body:
 			sent = true
 		default:
-			// 发送失败，可能是通道已满或连接已关闭
 		}
 	}
 	if sent {
 		return NewSuccessResponse(nil)
 	} else {
 		return NewErrorResponse(ErrCodeSendFailed)
-	}
-}
-
-// getUidSession 获取某个UID对应的session
-func (h *Hub) getUidSession(uid string) ResponseInfo {
-	h.uidMapMutex.RLock()
-	clientIDs, ok := h.uidMap[uid]
-	h.uidMapMutex.RUnlock()
-	if !ok || len(clientIDs) == 0 {
-		return NewErrorResponse(ErrCodeUIDNotOnline)
-	}
-
-	h.sessionsMutex.RLock()
-	session, ok := h.sessions[uid]
-	h.sessionsMutex.RUnlock()
-	if ok {
-		return NewSuccessResponse(map[string]interface{}{
-			"session": session,
-		})
-	} else {
-		return NewSuccessResponse(map[string]interface{}{
-			"session": nil,
-		})
-	}
-}
-
-// setUidSession 设置某个UID对应的session
-func (h *Hub) setUidSession(uid string, session map[string]interface{}) ResponseInfo {
-	h.uidMapMutex.RLock()
-	defer h.uidMapMutex.RUnlock()
-	clientIDs, ok := h.uidMap[uid]
-	if !ok || len(clientIDs) == 0 {
-		return NewErrorResponse(ErrCodeUIDNotOnline)
-	}
-
-	h.sessionsMutex.Lock()
-	h.sessions[uid] = session
-	h.sessionsMutex.Unlock()
-	return NewSuccessResponse(nil)
-}
-
-// getClientSession 获取某个client_id对应的session
-func (h *Hub) getClientSession(clientID string) ResponseInfo {
-	h.clientsMutex.RLock()
-	client, ok := h.clients[clientID]
-	h.clientsMutex.RUnlock()
-	if !ok {
-		return NewErrorResponse(ErrCodeClientNotFound)
-	}
-	client.mutex.RLock()
-	session := client.Session
-	client.mutex.RUnlock()
-
-	return NewSuccessResponse(map[string]interface{}{
-		"session": session,
-	})
-}
-
-// setClientSession 设置某个client_id对应的session
-func (h *Hub) setClientSession(clientID string, session map[string]interface{}) ResponseInfo {
-	h.clientsMutex.RLock()
-	defer h.clientsMutex.RUnlock()
-	client, ok := h.clients[clientID]
-	if !ok {
-		return NewErrorResponse(ErrCodeClientNotFound)
-	}
-
-	client.mutex.Lock()
-	client.Session = session
-	client.mutex.Unlock()
-	return NewSuccessResponse(nil)
-}
-
-// handleRPCResponse 处理来自客户端的RPC响应
-func (h *Hub) handleRPCResponse(uid string, response map[string]interface{}) {
-	id, hasID := response["_id"]
-	method, hasMethod := response["_method"]
-
-	if hasID && hasMethod {
-		var idStr string
-		switch v := id.(type) {
-		case uint64:
-			idStr = strconv.FormatUint(v, 10)
-		case uint32:
-			idStr = strconv.FormatUint(uint64(v), 10)
-		case int64:
-			idStr = strconv.FormatInt(v, 10)
-		case int32:
-			idStr = strconv.FormatInt(int64(v), 10)
-		case int:
-			idStr = strconv.Itoa(v)
-		case float64:
-			idStr = strconv.FormatInt(int64(v), 10)
-		case string:
-			idStr = v
-		default:
-			idStr = fmt.Sprintf("%v", v)
-		}
-
-		// RCP等待通道：唯一KEY = uid + _id + _method
-		rpcKey := fmt.Sprintf("%s_%s_%s", uid, idStr, method)
-
-		h.rpcMutex.RLock()
-		rpcChan, ok := h.rpcCalls[rpcKey]
-		h.rpcMutex.RUnlock()
-
-		if ok {
-			// 发送响应到等待的RPC调用
-			select {
-			case rpcChan <- response:
-			default:
-				// 通道已满或关闭
-			}
-		}
-	}
-}
-
-// callRPC 发起RPC调用并等待响应
-func (h *Hub) callRPC(uid string, body []byte, req *RPCRequest) ResponseInfo {
-	h.uidMapMutex.RLock()
-	clientIDs, ok := h.uidMap[uid]
-	h.uidMapMutex.RUnlock()
-	if !ok || len(clientIDs) == 0 {
-		return NewErrorResponse(ErrCodeUIDNotOnline)
-	}
-
-	// RCP等待通道：唯一KEY = uid + _id + _method
-	rpcKey := fmt.Sprintf("%s_%d_%s", uid, req.ID, req.Method)
-	rpcChan := make(chan interface{}, 1)
-
-	h.rpcMutex.Lock()
-	h.rpcCalls[rpcKey] = rpcChan
-	h.rpcMutex.Unlock()
-
-	// 确保在函数退出时清理rpcCalls
-	defer func() {
-		h.rpcMutex.Lock()
-		delete(h.rpcCalls, rpcKey)
-		h.rpcMutex.Unlock()
-	}()
-
-	// 发送RPC请求
-	sent := false
-	h.clientsMutex.RLock()
-	for _, clientID := range clientIDs {
-		client, clientExists := h.clients[clientID]
-		if !clientExists {
-			continue
-		}
-
-		select {
-		case client.Send <- body:
-			sent = true
-		default:
-			// 发送失败，可能是通道已满或连接已关闭
-		}
-	}
-	h.clientsMutex.RUnlock()
-
-	if !sent {
-		return NewErrorResponse(ErrCodeUnableToSendRPC)
-	}
-
-	// 等待响应或超时
-	select {
-	case result := <-rpcChan:
-		return NewSuccessResponse(result)
-	case <-time.After(10 * time.Second):
-		return NewErrorResponse(ErrCodeRPCTimeout)
 	}
 }
 
@@ -1102,13 +873,11 @@ func (h *Hub) joinGroup(groupName, clientID string) ResponseInfo {
 		return NewErrorResponse(ErrCodeClientNotFound)
 	}
 
-	// 初始化群组映射
 	h.groupsMutex.Lock()
 	if h.groups[groupName] == nil {
 		h.groups[groupName] = make(map[string]int64)
 	}
 
-	// 将客户端添加到群组，记录加入毫秒时间戳
 	h.groups[groupName][clientID] = time.Now().UnixMilli()
 	h.groupsMutex.Unlock()
 	slog.Debug(fmt.Sprintf("客户端 %s 已加入群组 %s", clientID, groupName))
@@ -1125,15 +894,12 @@ func (h *Hub) leaveGroup(groupName, clientID string) ResponseInfo {
 		return NewErrorResponse(ErrCodeGroupNotFound)
 	}
 
-	// 检查客户端是否在群组中
 	if _, inGroup := group[clientID]; !inGroup {
 		return NewErrorResponse(ErrCodeNotInGroup)
 	}
 
-	// 从群组中移除客户端
 	delete(group, clientID)
 
-	// 如果群组为空，清理群组
 	if len(group) == 0 {
 		delete(h.groups, groupName)
 	}
@@ -1167,7 +933,6 @@ func (h *Hub) sendToGroup(req SendToGroupRequest) ResponseInfo {
 		return NewErrorResponse(ErrCodeGroupEmpty)
 	}
 
-	// 创建要发送的客户端列表
 	targetClients := make(map[string]*Client)
 
 	h.clientsMutex.RLock()
@@ -1176,7 +941,6 @@ func (h *Hub) sendToGroup(req SendToGroupRequest) ResponseInfo {
 	// 如果指定了client_ids，则只向这些客户端发送
 	if len(req.ClientIDs) > 0 {
 		for _, clientID := range req.ClientIDs {
-			// 检查客户端是否在群组中
 			if _, inGroup := group[clientID]; inGroup {
 				if client, ok := h.clients[clientID]; ok {
 					targetClients[clientID] = client
@@ -1184,7 +948,6 @@ func (h *Hub) sendToGroup(req SendToGroupRequest) ResponseInfo {
 			}
 		}
 	} else {
-		// 否则向群组中的所有客户端发送
 		for clientID := range group {
 			if client, ok := h.clients[clientID]; ok {
 				targetClients[clientID] = client
@@ -1192,7 +955,6 @@ func (h *Hub) sendToGroup(req SendToGroupRequest) ResponseInfo {
 		}
 	}
 
-	// 优化：如果目标客户端为空，直接返回
 	if len(targetClients) == 0 {
 		return NewErrorResponse(ErrCodeSendFailedGroupEmpty)
 	}
@@ -1203,7 +965,6 @@ func (h *Hub) sendToGroup(req SendToGroupRequest) ResponseInfo {
 			delete(targetClients, clientID)
 		}
 
-		// 优化：如果目标客户端为空，直接返回
 		if len(targetClients) == 0 {
 			return NewErrorResponse(ErrCodeSendFailedGroupEmptyExcludeClients)
 		}
@@ -1221,165 +982,60 @@ func (h *Hub) sendToGroup(req SendToGroupRequest) ResponseInfo {
 		}
 		h.uidMapMutex.RUnlock()
 
-		// 优化：如果目标客户端为空，直接返回
 		if len(targetClients) == 0 {
 			return NewErrorResponse(ErrCodeSendFailedGroupEmptyExcludeUIDs)
 		}
 	}
 
-	// 发送消息并统计成功和失败数量
-	result := h.sendToClients(targetClients, req.Data)
-	return NewSuccessResponse(result)
+	return NewSuccessResponse(sendToClients(targetClients, req.Data))
 }
 
-// getClientIdCountByGroup 获取群组中的在线客户端数量
-func (h *Hub) getClientIdCountByGroup(groupName string) ResponseInfo {
-	h.groupsMutex.RLock()
-	group, ok := h.groups[groupName]
-	h.groupsMutex.RUnlock()
-	if !ok {
-		return NewErrorResponse(ErrCodeGroupNotFound)
-	}
+// handleRPCResponse 处理来自客户端的RPC响应
+func (h *Hub) handleRPCResponse(uid string, response map[string]interface{}) {
+	id, hasID := response["_id"]
+	method, hasMethod := response["_method"]
 
-	count := 0
-	h.clientsMutex.RLock()
-	for clientID := range group {
-		if _, clientExists := h.clients[clientID]; clientExists {
-			count++
+	if hasID && hasMethod {
+		var idStr string
+		switch v := id.(type) {
+		case uint64:
+			idStr = strconv.FormatUint(v, 10)
+		case uint32:
+			idStr = strconv.FormatUint(uint64(v), 10)
+		case int64:
+			idStr = strconv.FormatInt(v, 10)
+		case int32:
+			idStr = strconv.FormatInt(int64(v), 10)
+		case int:
+			idStr = strconv.Itoa(v)
+		case float64:
+			idStr = strconv.FormatInt(int64(v), 10)
+		case string:
+			idStr = v
+		default:
+			idStr = fmt.Sprintf("%v", v)
 		}
-	}
-	h.clientsMutex.RUnlock()
 
-	return NewSuccessResponse(map[string]interface{}{
-		"count": count,
-	})
-}
+		// RCP等待通道，唯一key：uid + _id + _method
+		rpcKey := fmt.Sprintf("%s_%s_%s", uid, idStr, method)
 
-// getClientSessionsByGroup 获取群组中所有客户端的session信息
-func (h *Hub) getClientSessionsByGroup(groupName string) ResponseInfo {
-	h.groupsMutex.RLock()
-	group, ok := h.groups[groupName]
-	h.groupsMutex.RUnlock()
-	if !ok || len(group) == 0 {
-		return NewErrorResponse(ErrCodeGroupNotFound)
-	}
+		h.rpcMutex.RLock()
+		rpcChan, ok := h.rpcCalls[rpcKey]
+		h.rpcMutex.RUnlock()
 
-	sessions := make(map[string]interface{})
-	h.clientsMutex.RLock()
-	for clientID := range group {
-		// 检查客户端是否在线
-		if client, clientExists := h.clients[clientID]; clientExists {
-			client.mutex.RLock()
-			sessions[clientID] = client.Session
-			client.mutex.RUnlock()
-		}
-	}
-	h.clientsMutex.RUnlock()
-
-	return NewSuccessResponse(map[string]interface{}{
-		"sessions": sessions,
-	})
-}
-
-// getClientIdListByGroup 获取群组中的所有client_id到毫秒时间戳的映射
-func (h *Hub) getClientIdListByGroup(groupName string) ResponseInfo {
-	h.groupsMutex.RLock()
-	group, ok := h.groups[groupName]
-	h.groupsMutex.RUnlock()
-	if !ok {
-		return NewErrorResponse(ErrCodeGroupNotFound)
-	}
-
-	// 过滤出仍然在线的client_id及其加入时间戳
-	clients := make(map[string]int64)
-	h.clientsMutex.RLock()
-	for clientID, timestamp := range group {
-		if _, clientExists := h.clients[clientID]; clientExists {
-			clients[clientID] = timestamp
-		}
-	}
-	h.clientsMutex.RUnlock()
-
-	if len(clients) == 0 {
-		return NewSuccessResponse(map[string]interface{}{
-			"clients": nil,
-		})
-	}
-
-	return NewSuccessResponse(map[string]interface{}{
-		"clients": clients,
-	})
-}
-
-// getUidListByGroup 获取群组中所有客户端绑定的UID列表
-func (h *Hub) getUidListByGroup(groupName string) ResponseInfo {
-	h.groupsMutex.RLock()
-	group, ok := h.groups[groupName]
-	h.groupsMutex.RUnlock()
-	if !ok {
-		return NewErrorResponse(ErrCodeGroupNotFound)
-	}
-
-	// 收集群组中所有在线客户端绑定的UID
-	uidSet := make(map[string]bool)
-	h.clientsMutex.RLock()
-	for clientID := range group {
-		if client, clientExists := h.clients[clientID]; clientExists {
-			client.mutex.RLock()
-			if client.UID != "" {
-				uidSet[client.UID] = true
-			}
-			client.mutex.RUnlock()
-		}
-	}
-	h.clientsMutex.RUnlock()
-
-	if len(uidSet) == 0 {
-		return NewSuccessResponse(map[string]interface{}{
-			"uids": nil,
-		})
-	}
-
-	uids := make([]string, 0, len(uidSet))
-	for uid := range uidSet {
-		uids = append(uids, uid)
-	}
-
-	return NewSuccessResponse(map[string]interface{}{
-		"uids": uids,
-	})
-}
-
-// getUidCountByGroup 获取群组中客户端绑定的UID数量
-func (h *Hub) getUidCountByGroup(groupName string) ResponseInfo {
-	h.groupsMutex.RLock()
-	group, ok := h.groups[groupName]
-	h.groupsMutex.RUnlock()
-	if !ok {
-		return NewErrorResponse(ErrCodeGroupNotFound)
-	}
-
-	// 统计群组中不同UID的数量
-	uidSet := make(map[string]bool)
-	h.clientsMutex.RLock()
-	for clientID := range group {
-		if client, clientExists := h.clients[clientID]; clientExists {
-			if client.UID != "" {
-				client.mutex.RLock()
-				uidSet[client.UID] = true
-				client.mutex.RUnlock()
+		if ok {
+			// 发送响应到等待的RPC调用
+			select {
+			case rpcChan <- response:
+			default:
+				// 通道已满或关闭
 			}
 		}
 	}
-	h.clientsMutex.RUnlock()
-
-	return NewSuccessResponse(map[string]interface{}{
-		"count": len(uidSet),
-	})
 }
 
-// getGroupByUid 获取指定UID所属的所有群组及详细信息
-func (h *Hub) getGroupByUid(uid string) ResponseInfo {
+// callRPC 发起RPC调用并等待响应
+func (h *Hub) callRPC(uid string, body []byte, req *RPCRequest) ResponseInfo {
 	h.uidMapMutex.RLock()
 	clientIDs, ok := h.uidMap[uid]
 	h.uidMapMutex.RUnlock()
@@ -1387,43 +1043,79 @@ func (h *Hub) getGroupByUid(uid string) ResponseInfo {
 		return NewErrorResponse(ErrCodeUIDNotOnline)
 	}
 
-	groupInfo := make(map[string]map[string]int64)
+	// RCP等待通道，唯一key：uid + _id + _method
+	rpcKey := fmt.Sprintf("%s_%d_%s", uid, req.ID, req.Method)
+	rpcChan := make(chan interface{}, 1)
 
-	// 遍历该UID绑定的所有客户端
+	h.rpcMutex.Lock()
+	h.rpcCalls[rpcKey] = rpcChan
+	h.rpcMutex.Unlock()
+
+	defer func() {
+		h.rpcMutex.Lock()
+		delete(h.rpcCalls, rpcKey)
+		h.rpcMutex.Unlock()
+	}()
+
+	sent := false
 	h.clientsMutex.RLock()
-	h.groupsMutex.RLock()
 	for _, clientID := range clientIDs {
-		// 检查客户端是否在线
-		if _, clientExists := h.clients[clientID]; clientExists {
-			// 检查该客户端属于哪些群组
-			for groupName, clients := range h.groups {
-				// 如果该客户端在群组中，记录其加入时间
-				if timestamp, inGroup := clients[clientID]; inGroup {
-					if groupInfo[groupName] == nil {
-						groupInfo[groupName] = make(map[string]int64)
-					}
-					groupInfo[groupName][clientID] = timestamp
-				}
-			}
+		client, clientExists := h.clients[clientID]
+		if !clientExists {
+			continue
+		}
+
+		select {
+		case client.Send <- body:
+			sent = true
+		default:
+			// 发送失败，可能是通道已满或连接已关闭
 		}
 	}
-	h.groupsMutex.RUnlock()
 	h.clientsMutex.RUnlock()
 
-	if len(groupInfo) == 0 {
-		return NewSuccessResponse(map[string]interface{}{
-			"groups": nil,
-		})
+	if !sent {
+		return NewErrorResponse(ErrCodeUnableToSendRPC)
 	}
 
-	return NewSuccessResponse(map[string]interface{}{
-		"groups": groupInfo,
-	})
+	// 等待响应或超时
+	select {
+	case result := <-rpcChan:
+		return NewSuccessResponse(result)
+	case <-time.After(10 * time.Second):
+		return NewErrorResponse(ErrCodeRPCTimeout)
+	}
+}
+
+// sendToClients 向指定客户端列表发送消息并返回成功和失败数量
+func sendToClients(targetClients map[string]*Client, data string) map[string]interface{} {
+	successCount := 0
+	failureCount := 0
+
+	for _, client := range targetClients {
+		select {
+		case client.Send <- []byte(data):
+			successCount++
+		default:
+			failureCount++
+		}
+	}
+
+	return map[string]interface{}{
+		"success": successCount,
+		"failure": failureCount,
+	}
+}
+
+// generateNanoMd5 生成auth字符串（纳秒时间戳md5后的32字节小写字符串）
+func generateNanoMd5() string {
+	nanoStr := strconv.FormatInt(time.Now().UnixNano(), 10)
+	hash := md5.Sum([]byte(nanoStr))
+	return hex.EncodeToString(hash[:])
 }
 
 // sendWebhook 发送webhook请求
-func (h *Hub) sendWebhook(uid, clientID, event string) {
-	// 读取配置（使用读锁）
+func sendWebhook(uid, clientID, event string) {
 	configMutex.RLock()
 	webhookURL := config.Webhook
 	token := config.Token
@@ -1433,7 +1125,6 @@ func (h *Hub) sendWebhook(uid, clientID, event string) {
 		return
 	}
 
-	// 创建一个goroutine，避免阻塞
 	go func() {
 		payload := WebhookPayload{
 			UID:      uid,
@@ -1487,10 +1178,8 @@ func handleStats(c *gin.Context) {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
-	// 计算运行时间
 	uptime := time.Since(startTime)
 
-	// 获取在线客户端和UID数量
 	hub.clientsMutex.RLock()
 	onlineClients := len(hub.clients)
 	hub.clientsMutex.RUnlock()
@@ -1541,6 +1230,14 @@ func generateSignature(data, timestamp, token string) string {
 func verifySignature(data, timestamp, token, signature string) bool {
 	expectedSignature := generateSignature(data, timestamp, token)
 	return expectedSignature == signature
+}
+
+// absValue 返回绝对值
+func absValue(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // handleVersion 处理版本信息请求
@@ -1679,46 +1376,38 @@ func handleErrorMessageMap(c *gin.Context) {
 func sendToAllHandler(c *gin.Context) {
 	var req SendToAllRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
 		return
 	}
 
 	if req.Data == "" {
-		resp := NewCustomErrorResponse(ErrCodeInvalidParams, "缺少data参数")
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewCustomErrorResponse(ErrCodeInvalidParams, "缺少data参数"))
 		return
 	}
 
-	resp := hub.sendToAll(req)
-	c.JSON(http.StatusOK, resp)
+	c.JSON(http.StatusOK, hub.sendToAll(req))
 }
 
 // HTTP处理函数，向指定client_id发送数据
 func sendToClientHandler(c *gin.Context) {
 	clientID := c.Query("client_id")
 	if clientID == "" {
-		resp := NewErrorResponse(ErrCodeMissingClientID)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingClientID))
 		return
 	}
 
-	// 读取请求体作为字符串
 	body, err := c.GetRawData()
 	if err != nil {
-		resp := NewErrorResponse(ErrCodeReadBodyFailed)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeReadBodyFailed))
 		return
 	}
 
 	if len(body) == 0 {
-		resp := NewErrorResponse(ErrCodeEmptyBody)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeEmptyBody))
 		return
 	}
 
-	resp := hub.sendToClient(clientID, body)
-	c.JSON(http.StatusOK, resp)
+	c.JSON(http.StatusOK, hub.sendToClient(clientID, body))
 }
 
 // HTTP处理函数，断开指定client_id的客户端连接
@@ -1728,23 +1417,19 @@ func closeClientHandler(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
 		return
 	}
 
 	if req.ClientID == "" {
-		resp := NewErrorResponse(ErrCodeMissingClientID)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingClientID))
 		return
 	}
 
 	if hub.closeClient(req.ClientID) {
-		resp := NewSuccessResponse(nil)
-		c.JSON(http.StatusOK, resp)
+		c.JSON(http.StatusOK, NewSuccessResponse(nil))
 	} else {
-		resp := NewErrorResponse(ErrCodeClientNotFound)
-		c.JSON(http.StatusOK, resp)
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeClientNotFound))
 	}
 }
 
@@ -1752,313 +1437,75 @@ func closeClientHandler(c *gin.Context) {
 func isClientOnlineHandler(c *gin.Context) {
 	clientID := c.Query("client_id")
 	if clientID == "" {
-		resp := NewErrorResponse(ErrCodeMissingClientID)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingClientID))
 		return
 	}
 
-	online := hub.isClientOnline(clientID)
-	data := map[string]interface{}{
-		"online": online,
-	}
-	resp := NewSuccessResponse(data)
-	c.JSON(http.StatusOK, resp)
-}
+	hub.clientsMutex.RLock()
+	_, ok := hub.clients[clientID]
+	hub.clientsMutex.RUnlock()
 
-// HTTP处理函数，用于处理绑定UID的请求
-func bindUidHandler(c *gin.Context) {
-	var req BindRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	// 检查必要参数
-	if req.ClientID == "" {
-		resp := NewErrorResponse(ErrCodeMissingClientID)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	if req.UID == "" {
-		resp := NewErrorResponse(ErrCodeMissingUID)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	if req.Auth == "" {
-		resp := NewErrorResponse(ErrCodeMissingAuth)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	resp := hub.bindUid(req.ClientID, req.UID, req.Auth)
-	c.JSON(http.StatusOK, resp)
-}
-
-// HTTP处理函数，解绑UID
-func unbindUidHandler(c *gin.Context) {
-	var req BindRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	// 检查必要参数
-	if req.ClientID == "" {
-		resp := NewErrorResponse(ErrCodeMissingClientID)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	if req.UID == "" {
-		resp := NewErrorResponse(ErrCodeMissingUID)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	resp := hub.unbindUid(req.ClientID, req.UID, req.Auth)
-	c.JSON(http.StatusOK, resp)
-}
-
-// HTTP处理函数，判断UID是否在线
-func isUidOnlineHandler(c *gin.Context) {
-	uid := c.Query("uid")
-	if uid == "" {
-		resp := NewErrorResponse(ErrCodeMissingUID)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	online := hub.isUidOnline(uid)
-	data := map[string]interface{}{
-		"online": online,
-	}
-	resp := NewSuccessResponse(data)
-	c.JSON(http.StatusOK, resp)
-}
-
-// HTTP处理函数，发送字符串数据到指定UID的所有在线客户端
-func sendToUidHandler(c *gin.Context) {
-	uid := c.Query("uid")
-	if uid == "" {
-		resp := NewErrorResponse(ErrCodeMissingUID)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	// 读取请求体作为字符串
-	body, err := c.GetRawData()
-	if err != nil {
-		resp := NewErrorResponse(ErrCodeReadBodyFailed)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	if len(body) == 0 {
-		resp := NewErrorResponse(ErrCodeEmptyBody)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	c.JSON(http.StatusOK, hub.sendToUid(uid, body))
-}
-
-// HTTP处理函数，获取UID的session
-func getUidSessionHandler(c *gin.Context) {
-	uid := c.Query("uid")
-	if uid == "" {
-		resp := NewErrorResponse(ErrCodeMissingUID)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	c.JSON(http.StatusOK, hub.getUidSession(uid))
-}
-
-// HTTP处理函数，设置UID的session
-func setUidSessionHandler(c *gin.Context) {
-	uid := c.Query("uid")
-	if uid == "" {
-		resp := NewErrorResponse(ErrCodeMissingUID)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	var session map[string]interface{}
-	if err := c.ShouldBindJSON(&session); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	c.JSON(http.StatusOK, hub.setUidSession(uid, session))
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		"online": ok,
+	}))
 }
 
 // HTTP处理函数，获取client_id的session
 func getClientSessionHandler(c *gin.Context) {
 	clientID := c.Query("client_id")
 	if clientID == "" {
-		resp := NewErrorResponse(ErrCodeMissingClientID)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingClientID))
 		return
 	}
 
-	c.JSON(http.StatusOK, hub.getClientSession(clientID))
+	hub.clientsMutex.RLock()
+	client, ok := hub.clients[clientID]
+	hub.clientsMutex.RUnlock()
+	if !ok {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeClientNotFound))
+		return
+	}
+
+	client.mutex.RLock()
+	session := client.Session
+	client.mutex.RUnlock()
+
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		"session": session,
+	}))
 }
 
 // HTTP处理函数，设置client_id的session
 func setClientSessionHandler(c *gin.Context) {
 	clientID := c.Query("client_id")
 	if clientID == "" {
-		resp := NewErrorResponse(ErrCodeMissingClientID)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingClientID))
 		return
 	}
 
 	var session map[string]interface{}
 	if err := c.ShouldBindJSON(&session); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
 		return
 	}
 
-	c.JSON(http.StatusOK, hub.setClientSession(clientID, session))
-}
-
-// HTTP处理函数，RPC调用接口
-func rpcHandler(c *gin.Context) {
-	// 从请求头获取UID
-	uid := c.GetHeader("uid")
-	if uid == "" {
-		resp := NewErrorResponse(ErrCodeMissingUIDHeader)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	// 读取请求体作为字符串
-	body, err := c.GetRawData()
-	if err != nil {
-		resp := NewErrorResponse(ErrCodeReadBodyFailed)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	if len(body) == 0 {
-		resp := NewErrorResponse(ErrCodeEmptyBody)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	req := &RPCRequest{}
-	if err := json.Unmarshal(body, req); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	if req.ID == 0 {
-		resp := NewErrorResponse(ErrCodeMissingID)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	if req.Method == "" {
-		resp := NewErrorResponse(ErrCodeMissingMethod)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	c.JSON(http.StatusOK, hub.callRPC(uid, body, req))
-}
-
-// HTTP处理函数，根据UID获取所有绑定的在线client_id
-func getClientIdByUidHandler(c *gin.Context) {
-	uid := c.Query("uid")
-	if uid == "" {
-		resp := NewErrorResponse(ErrCodeMissingUID)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	hub.uidMapMutex.RLock()
-	clientIDs, ok := hub.uidMap[uid]
-	hub.uidMapMutex.RUnlock()
+	hub.clientsMutex.RLock()
+	defer hub.clientsMutex.RUnlock()
+	client, ok := hub.clients[clientID]
 	if !ok {
-		resp := NewErrorResponse(ErrCodeUIDNotOnline)
-		c.JSON(http.StatusOK, resp)
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeClientNotFound))
 		return
 	}
 
-	onlineClientIDs := make([]string, 0)
-	hub.clientsMutex.RLock()
-	for _, clientID := range clientIDs {
-		if _, clientExists := hub.clients[clientID]; clientExists {
-			onlineClientIDs = append(onlineClientIDs, clientID)
-		}
-	}
-	hub.clientsMutex.RUnlock()
+	client.mutex.Lock()
+	client.Session = session
+	client.mutex.Unlock()
 
-	data := map[string]interface{}{
-		"client_ids": onlineClientIDs,
-	}
-	resp := NewSuccessResponse(data)
-	c.JSON(http.StatusOK, resp)
-}
-
-// HTTP处理函数，根据client_id获取绑定的UID
-func getUidByClientIdHandler(c *gin.Context) {
-	clientID := c.Query("client_id")
-	if clientID == "" {
-		resp := NewErrorResponse(ErrCodeMissingClientID)
-		c.JSON(http.StatusBadRequest, resp)
-		return
-	}
-
-	hub.clientsMutex.RLock()
-	client, exists := hub.clients[clientID]
-	hub.clientsMutex.RUnlock()
-
-	if !exists {
-		resp := NewErrorResponse(ErrCodeClientNotFound)
-		c.JSON(http.StatusOK, resp)
-		return
-	}
-
-	client.mutex.RLock()
-	defer client.mutex.RUnlock()
-	var data map[string]interface{}
-	if client.UID == "" {
-		data = map[string]interface{}{
-			"uid": nil,
-		}
-	} else {
-		data = map[string]interface{}{
-			"uid": client.UID,
-		}
-	}
-
-	resp := NewSuccessResponse(data)
-	c.JSON(http.StatusOK, resp)
-}
-
-// HTTP处理函数，获取全局所有在线UID数量
-func getAllUidCountHandler(c *gin.Context) {
-	hub.uidMapMutex.RLock()
-	onlineUidCount := len(hub.uidMap)
-	hub.uidMapMutex.RUnlock()
-
-	data := map[string]interface{}{
-		"count": onlineUidCount,
-	}
-	resp := NewSuccessResponse(data)
-	c.JSON(http.StatusOK, resp)
+	c.JSON(http.StatusOK, NewSuccessResponse(nil))
 }
 
 // HTTP处理函数，获取当前在线连接总数
-func getAllClientCountHandler(c *gin.Context) {
+func getAllClientIdCountHandler(c *gin.Context) {
 	hub.clientsMutex.RLock()
 	count := len(hub.clients)
 	hub.clientsMutex.RUnlock()
@@ -2076,11 +1523,9 @@ func getAllClientIdListHandler(c *gin.Context) {
 	defer hub.clientsMutex.RUnlock()
 
 	if len(hub.clients) == 0 {
-		data := map[string]interface{}{
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
 			"client_ids": nil,
-		}
-		resp := NewSuccessResponse(data)
-		c.JSON(http.StatusOK, resp)
+		}))
 		return
 	}
 
@@ -2089,46 +1534,9 @@ func getAllClientIdListHandler(c *gin.Context) {
 		clientIDs = append(clientIDs, clientID)
 	}
 
-	data := map[string]interface{}{
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
 		"client_ids": clientIDs,
-	}
-	resp := NewSuccessResponse(data)
-	c.JSON(http.StatusOK, resp)
-}
-
-// HTTP处理函数，获取所有在线uid列表
-func getAllUidListHandler(c *gin.Context) {
-	hub.uidMapMutex.RLock()
-	defer hub.uidMapMutex.RUnlock()
-	uidLen := len(hub.uidMap)
-	if uidLen == 0 {
-		data := map[string]interface{}{
-			"uids": nil,
-		}
-		resp := NewSuccessResponse(data)
-		c.JSON(http.StatusOK, resp)
-		return
-	}
-
-	uids := make([]string, 0, uidLen)
-	for uid := range hub.uidMap {
-		uids = append(uids, uid)
-	}
-
-	if len(uids) == 0 {
-		data := map[string]interface{}{
-			"uids": nil,
-		}
-		resp := NewSuccessResponse(data)
-		c.JSON(http.StatusOK, resp)
-		return
-	}
-
-	data := map[string]interface{}{
-		"uids": uids,
-	}
-	resp := NewSuccessResponse(data)
-	c.JSON(http.StatusOK, resp)
+	}))
 }
 
 // HTTP处理函数，获取所有在线客户端的session信息
@@ -2137,11 +1545,9 @@ func getAllClientSessionsHandler(c *gin.Context) {
 	defer hub.clientsMutex.RUnlock()
 
 	if len(hub.clients) == 0 {
-		data := map[string]interface{}{
-			"sessions": map[string]interface{}{},
-		}
-		resp := NewSuccessResponse(data)
-		c.JSON(http.StatusOK, resp)
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"sessions": nil,
+		}))
 		return
 	}
 
@@ -2152,58 +1558,227 @@ func getAllClientSessionsHandler(c *gin.Context) {
 		client.mutex.RUnlock()
 	}
 
-	data := map[string]interface{}{
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
 		"sessions": sessions,
+	}))
+}
+
+// HTTP处理函数，用于处理绑定UID的请求
+func bindUidHandler(c *gin.Context) {
+	var req BindRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
+		return
 	}
-	resp := NewSuccessResponse(data)
-	c.JSON(http.StatusOK, resp)
+
+	if req.ClientID == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingClientID))
+		return
+	}
+
+	if req.UID == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
+		return
+	}
+
+	if req.Auth == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingAuth))
+		return
+	}
+
+	c.JSON(http.StatusOK, hub.bindUid(req.ClientID, req.UID, req.Auth))
+}
+
+// HTTP处理函数，解绑UID
+func unbindUidHandler(c *gin.Context) {
+	var req BindRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
+		return
+	}
+
+	if req.ClientID == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingClientID))
+		return
+	}
+
+	if req.UID == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
+		return
+	}
+
+	c.JSON(http.StatusOK, hub.unbindUid(req.ClientID, req.UID, req.Auth))
+}
+
+// HTTP处理函数，判断UID是否在线
+func isUidOnlineHandler(c *gin.Context) {
+	uid := c.Query("uid")
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
+		return
+	}
+
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		"online": hub.isUidOnline(uid),
+	}))
+}
+
+// HTTP处理函数，发送字符串数据到指定UID的所有在线客户端
+func sendToUidHandler(c *gin.Context) {
+	uid := c.Query("uid")
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
+		return
+	}
+
+	body, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeReadBodyFailed))
+		return
+	}
+
+	if len(body) == 0 {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeEmptyBody))
+		return
+	}
+
+	c.JSON(http.StatusOK, hub.sendToUid(uid, body))
+}
+
+// HTTP处理函数，根据UID获取所有绑定的在线client_id
+func getClientIdByUidHandler(c *gin.Context) {
+	uid := c.Query("uid")
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
+		return
+	}
+
+	hub.uidMapMutex.RLock()
+	clientIDs, ok := hub.uidMap[uid]
+	hub.uidMapMutex.RUnlock()
+	if !ok {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeUIDNotOnline))
+		return
+	}
+
+	onlineClientIDs := make([]string, 0)
+	hub.clientsMutex.RLock()
+	for _, clientID := range clientIDs {
+		if _, clientExists := hub.clients[clientID]; clientExists {
+			onlineClientIDs = append(onlineClientIDs, clientID)
+		}
+	}
+	hub.clientsMutex.RUnlock()
+
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		"client_ids": onlineClientIDs,
+	}))
+}
+
+// HTTP处理函数，根据client_id获取绑定的UID
+func getUidByClientIdHandler(c *gin.Context) {
+	clientID := c.Query("client_id")
+	if clientID == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingClientID))
+		return
+	}
+
+	hub.clientsMutex.RLock()
+	client, exists := hub.clients[clientID]
+	hub.clientsMutex.RUnlock()
+	if !exists {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeClientNotFound))
+		return
+	}
+
+	client.mutex.RLock()
+	defer client.mutex.RUnlock()
+	if client.UID == "" {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"uid": nil,
+		}))
+	} else {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"uid": client.UID,
+		}))
+	}
+}
+
+// HTTP处理函数，获取所有在线uid列表
+func getAllUidListHandler(c *gin.Context) {
+	hub.uidMapMutex.RLock()
+	defer hub.uidMapMutex.RUnlock()
+	uidLen := len(hub.uidMap)
+	if uidLen == 0 {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"uids": nil,
+		}))
+		return
+	}
+
+	uids := make([]string, 0, uidLen)
+	for uid := range hub.uidMap {
+		uids = append(uids, uid)
+	}
+
+	if len(uids) == 0 {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"uids": nil,
+		}))
+	} else {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"uids": uids,
+		}))
+	}
+}
+
+// HTTP处理函数，获取全局所有在线UID数量
+func getAllUidCountHandler(c *gin.Context) {
+	hub.uidMapMutex.RLock()
+	onlineUidCount := len(hub.uidMap)
+	hub.uidMapMutex.RUnlock()
+
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		"count": onlineUidCount,
+	}))
 }
 
 // HTTP处理函数，将客户端加入群组
 func joinGroupHandler(c *gin.Context) {
 	var req GroupRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
 		return
 	}
 
-	// 检查必要参数
 	if req.Group == "" {
-		resp := NewErrorResponse(ErrCodeMissingGroup)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingGroup))
 		return
 	}
 
 	if req.ClientID == "" {
-		resp := NewErrorResponse(ErrCodeMissingClientID)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingClientID))
 		return
 	}
 
-	resp := hub.joinGroup(req.Group, req.ClientID)
-	c.JSON(http.StatusOK, resp)
+	c.JSON(http.StatusOK, hub.joinGroup(req.Group, req.ClientID))
 }
 
 // HTTP处理函数，将客户端从群组中移除
 func leaveGroupHandler(c *gin.Context) {
 	var req GroupRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
 		return
 	}
 
-	// 检查必要参数
 	if req.Group == "" {
-		resp := NewErrorResponse(ErrCodeMissingGroup)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingGroup))
 		return
 	}
 
 	if req.ClientID == "" {
-		resp := NewErrorResponse(ErrCodeMissingClientID)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingClientID))
 		return
 	}
 
@@ -2217,15 +1792,12 @@ func ungroupHandler(c *gin.Context) {
 		Group string `json:"group"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
 		return
 	}
 
-	// 检查必要参数
 	if req.Group == "" {
-		resp := NewErrorResponse(ErrCodeMissingGroup)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingGroup))
 		return
 	}
 
@@ -2237,20 +1809,17 @@ func ungroupHandler(c *gin.Context) {
 func sendToGroupHandler(c *gin.Context) {
 	var req SendToGroupRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		resp := NewErrorResponse(ErrCodeInvalidParams)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
 		return
 	}
 
 	if req.Group == "" {
-		resp := NewErrorResponse(ErrCodeMissingGroup)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingGroup))
 		return
 	}
 
 	if req.Data == "" {
-		resp := NewErrorResponse(ErrCodeMissingData)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingData))
 		return
 	}
 
@@ -2259,67 +1828,181 @@ func sendToGroupHandler(c *gin.Context) {
 
 // HTTP处理函数，获取群组中的客户端数量
 func getClientIdCountByGroupHandler(c *gin.Context) {
-	group := c.Query("group")
-	if group == "" {
-		resp := NewErrorResponse(ErrCodeMissingGroup)
-		c.JSON(http.StatusBadRequest, resp)
+	groupName := c.Query("group")
+	if groupName == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingGroup))
 		return
 	}
 
-	resp := hub.getClientIdCountByGroup(group)
-	c.JSON(http.StatusOK, resp)
+	hub.groupsMutex.RLock()
+	group, ok := hub.groups[groupName]
+	hub.groupsMutex.RUnlock()
+	if !ok {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeGroupNotFound))
+		return
+	}
+
+	count := 0
+	hub.clientsMutex.RLock()
+	for clientID := range group {
+		if _, clientExists := hub.clients[clientID]; clientExists {
+			count++
+		}
+	}
+	hub.clientsMutex.RUnlock()
+
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		"count": count,
+	}))
 }
 
 // HTTP处理函数，获取群组中所有客户端的session信息
 func getClientSessionsByGroupHandler(c *gin.Context) {
-	group := c.Query("group")
-	if group == "" {
+	groupName := c.Query("group")
+	if groupName == "" {
 		resp := NewErrorResponse(ErrCodeMissingGroup)
 		c.JSON(http.StatusBadRequest, resp)
 		return
 	}
 
-	resp := hub.getClientSessionsByGroup(group)
-	c.JSON(http.StatusOK, resp)
+	hub.groupsMutex.RLock()
+	group, ok := hub.groups[groupName]
+	hub.groupsMutex.RUnlock()
+	if !ok || len(group) == 0 {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeGroupNotFound))
+		return
+	}
+
+	sessions := make(map[string]interface{})
+	hub.clientsMutex.RLock()
+	for clientID := range group {
+		if client, clientExists := hub.clients[clientID]; clientExists {
+			client.mutex.RLock()
+			sessions[clientID] = client.Session
+			client.mutex.RUnlock()
+		}
+	}
+	hub.clientsMutex.RUnlock()
+
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		"sessions": sessions,
+	}))
 }
 
 // HTTP处理函数，获取群组中的所有client_id列表
 func getClientIdListByGroupHandler(c *gin.Context) {
-	group := c.Query("group")
-	if group == "" {
-		resp := NewErrorResponse(ErrCodeMissingGroup)
-		c.JSON(http.StatusBadRequest, resp)
+	groupName := c.Query("group")
+	if groupName == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingGroup))
 		return
 	}
 
-	resp := hub.getClientIdListByGroup(group)
-	c.JSON(http.StatusOK, resp)
+	hub.groupsMutex.RLock()
+	group, ok := hub.groups[groupName]
+	hub.groupsMutex.RUnlock()
+	if !ok {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeGroupNotFound))
+		return
+	}
+
+	clients := make(map[string]int64)
+	hub.clientsMutex.RLock()
+	for clientID, timestamp := range group {
+		if _, clientExists := hub.clients[clientID]; clientExists {
+			clients[clientID] = timestamp
+		}
+	}
+	hub.clientsMutex.RUnlock()
+
+	if len(clients) == 0 {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"clients": nil,
+		}))
+	} else {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"clients": clients,
+		}))
+	}
 }
 
 // HTTP处理函数，获取群组中所有客户端绑定的UID列表
 func getUidListByGroupHandler(c *gin.Context) {
-	group := c.Query("group")
-	if group == "" {
-		resp := NewErrorResponse(ErrCodeMissingGroup)
-		c.JSON(http.StatusBadRequest, resp)
+	groupName := c.Query("group")
+	if groupName == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingGroup))
 		return
 	}
 
-	resp := hub.getUidListByGroup(group)
-	c.JSON(http.StatusOK, resp)
+	hub.groupsMutex.RLock()
+	group, ok := hub.groups[groupName]
+	hub.groupsMutex.RUnlock()
+	if !ok {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeGroupNotFound))
+		return
+	}
+
+	uidSet := make(map[string]bool)
+	hub.clientsMutex.RLock()
+	for clientID := range group {
+		if client, clientExists := hub.clients[clientID]; clientExists {
+			client.mutex.RLock()
+			if client.UID != "" {
+				uidSet[client.UID] = true
+			}
+			client.mutex.RUnlock()
+		}
+	}
+	hub.clientsMutex.RUnlock()
+
+	if len(uidSet) == 0 {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"uids": nil,
+		}))
+		return
+	}
+
+	uids := make([]string, 0, len(uidSet))
+	for uid := range uidSet {
+		uids = append(uids, uid)
+	}
+
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		"uids": uids,
+	}))
 }
 
 // HTTP处理函数，获取群组中客户端绑定的UID数量
 func getUidCountByGroupHandler(c *gin.Context) {
-	group := c.Query("group")
-	if group == "" {
-		resp := NewErrorResponse(ErrCodeMissingGroup)
-		c.JSON(http.StatusBadRequest, resp)
+	groupName := c.Query("group")
+	if groupName == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingGroup))
 		return
 	}
 
-	resp := hub.getUidCountByGroup(group)
-	c.JSON(http.StatusOK, resp)
+	hub.groupsMutex.RLock()
+	group, ok := hub.groups[groupName]
+	hub.groupsMutex.RUnlock()
+	if !ok {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeGroupNotFound))
+		return
+	}
+
+	uidSet := make(map[string]bool)
+	hub.clientsMutex.RLock()
+	for clientID := range group {
+		if client, clientExists := hub.clients[clientID]; clientExists {
+			if client.UID != "" {
+				client.mutex.RLock()
+				uidSet[client.UID] = true
+				client.mutex.RUnlock()
+			}
+		}
+	}
+	hub.clientsMutex.RUnlock()
+
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		"count": len(uidSet),
+	}))
 }
 
 // HTTP处理函数，获取全局所有在线群组的组名数组
@@ -2328,19 +2011,16 @@ func getAllGroupIdListHandler(c *gin.Context) {
 	defer hub.groupsMutex.RUnlock()
 	groupsLen := len(hub.groups)
 	if groupsLen == 0 {
-		resp := NewSuccessResponse(map[string]interface{}{
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
 			"groups": nil,
-		})
-		c.JSON(http.StatusOK, resp)
+		}))
 		return
 	}
 
 	hub.clientsMutex.RLock()
 	defer hub.clientsMutex.RUnlock()
-	// 收集所有群组名
 	groupNames := make([]string, 0, groupsLen)
 	for groupName := range hub.groups {
-		// 检查群组中是否有在线客户端
 		hasOnlineClients := false
 		for clientID := range hub.groups[groupName] {
 			if _, clientExists := hub.clients[clientID]; clientExists {
@@ -2349,53 +2029,179 @@ func getAllGroupIdListHandler(c *gin.Context) {
 			}
 		}
 
-		// 只有当群组中有在线客户端时才添加到结果中
 		if hasOnlineClients {
 			groupNames = append(groupNames, groupName)
 		}
 	}
 
 	if len(groupNames) == 0 {
-		resp := NewSuccessResponse(map[string]interface{}{
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
 			"groups": nil,
-		})
-		c.JSON(http.StatusOK, resp)
-		return
+		}))
+	} else {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"groups": groupNames,
+		}))
 	}
-
-	resp := NewSuccessResponse(map[string]interface{}{
-		"groups": groupNames,
-	})
-	c.JSON(http.StatusOK, resp)
 }
 
 // HTTP处理函数，获取指定UID所属的所有群组
 func getGroupByUidHandler(c *gin.Context) {
 	uid := c.Query("uid")
 	if uid == "" {
-		resp := NewErrorResponse(ErrCodeMissingUID)
-		c.JSON(http.StatusBadRequest, resp)
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
 		return
 	}
 
-	resp := hub.getGroupByUid(uid)
-	c.JSON(http.StatusOK, resp)
+	hub.uidMapMutex.RLock()
+	clientIDs, ok := hub.uidMap[uid]
+	hub.uidMapMutex.RUnlock()
+	if !ok || len(clientIDs) == 0 {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeUIDNotOnline))
+		return
+	}
+
+	groupInfo := make(map[string]map[string]int64)
+
+	hub.clientsMutex.RLock()
+	hub.groupsMutex.RLock()
+	for _, clientID := range clientIDs {
+		// 检查客户端是否在线
+		if _, clientExists := hub.clients[clientID]; clientExists {
+			// 检查该客户端属于哪些群组
+			for groupName, clients := range hub.groups {
+				// 如果该客户端在群组中，记录其加入时间
+				if timestamp, inGroup := clients[clientID]; inGroup {
+					if groupInfo[groupName] == nil {
+						groupInfo[groupName] = make(map[string]int64)
+					}
+					groupInfo[groupName][clientID] = timestamp
+				}
+			}
+		}
+	}
+	hub.groupsMutex.RUnlock()
+	hub.clientsMutex.RUnlock()
+
+	if len(groupInfo) == 0 {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"groups": nil,
+		}))
+	} else {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"groups": groupInfo,
+		}))
+	}
+}
+
+// HTTP处理函数，获取UID的session
+func getUidSessionHandler(c *gin.Context) {
+	uid := c.Query("uid")
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
+		return
+	}
+
+	hub.uidMapMutex.RLock()
+	clientIDs, ok := hub.uidMap[uid]
+	hub.uidMapMutex.RUnlock()
+	if !ok || len(clientIDs) == 0 {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeUIDNotOnline))
+		return
+	}
+
+	hub.sessionsMutex.RLock()
+	session, ok := hub.sessions[uid]
+	hub.sessionsMutex.RUnlock()
+	if ok {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"session": session,
+		}))
+	} else {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"session": nil,
+		}))
+	}
+}
+
+// HTTP处理函数，设置UID的session
+func setUidSessionHandler(c *gin.Context) {
+	uid := c.Query("uid")
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
+		return
+	}
+
+	var session map[string]interface{}
+	if err := c.ShouldBindJSON(&session); err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
+		return
+	}
+
+	hub.uidMapMutex.RLock()
+	defer hub.uidMapMutex.RUnlock()
+	clientIDs, ok := hub.uidMap[uid]
+	if !ok || len(clientIDs) == 0 {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeUIDNotOnline))
+		return
+	}
+
+	hub.sessionsMutex.Lock()
+	hub.sessions[uid] = session
+	hub.sessionsMutex.Unlock()
+
+	c.JSON(http.StatusOK, NewSuccessResponse(nil))
+}
+
+// HTTP处理函数，RPC调用接口
+func rpcHandler(c *gin.Context) {
+	uid := c.GetHeader("uid")
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUIDHeader))
+		return
+	}
+
+	body, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeReadBodyFailed))
+		return
+	}
+
+	if len(body) == 0 {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeEmptyBody))
+		return
+	}
+
+	req := &RPCRequest{}
+	if err := json.Unmarshal(body, req); err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
+		return
+	}
+
+	if req.ID == 0 {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingID))
+		return
+	}
+
+	if req.Method == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingMethod))
+		return
+	}
+
+	c.JSON(http.StatusOK, hub.callRPC(uid, body, req))
 }
 
 // HTTP处理函数，重新加载配置
 func reloadConfigHandler(c *gin.Context) {
-	// 读取配置文件路径（使用读锁）
 	configMutex.RLock()
 	currentConfigPath := configPath
 	configMutex.RUnlock()
 
 	if currentConfigPath == "" {
-		resp := NewErrorResponse(ErrCodeConfigFileNotFound)
-		c.JSON(http.StatusInternalServerError, resp)
+		c.JSON(http.StatusInternalServerError, NewErrorResponse(ErrCodeConfigFileNotFound))
 		return
 	}
 
-	// 尝试重新加载配置
 	if err := loadConfig(currentConfigPath); err != nil {
 		resp := NewCustomErrorResponse(ErrCodeConfigReloadFailed, fmt.Sprintf("配置重载失败: %v", err))
 		c.JSON(http.StatusInternalServerError, resp)
@@ -2425,19 +2231,106 @@ func getConfigHandler(c *gin.Context) {
 	currentConfig := *config
 	configMutex.RUnlock()
 
-	resp := NewSuccessResponse(currentConfig)
-	c.JSON(http.StatusOK, resp)
+	c.JSON(http.StatusOK, NewSuccessResponse(currentConfig))
 }
 
-// authMiddleware HTTP请求TOKEN验证中间件
+// NewAuthLimiter 创建新的认证限制器
+func NewAuthLimiter() *AuthLimiter {
+	limiter := &AuthLimiter{
+		failedAttempts: make(map[string]*FailedAttempt),
+	}
+
+	go limiter.cleanupRoutine()
+
+	return limiter
+}
+
+// cleanupRoutine 定期清理过期的失败记录
+func (al *AuthLimiter) cleanupRoutine() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			al.mutex.Lock()
+			now := time.Now()
+			for ip, attempt := range al.failedAttempts {
+				// 如果第一次失败时间超过5分钟，则清理记录
+				if now.Sub(attempt.FirstTime) > 5*time.Minute {
+					delete(al.failedAttempts, ip)
+				}
+			}
+			al.mutex.Unlock()
+		}
+	}
+}
+
+// IsBlocked 检查IP是否被封禁
+func (al *AuthLimiter) IsBlocked(ip string) bool {
+	al.mutex.RLock()
+	defer al.mutex.RUnlock()
+
+	attempt, exists := al.failedAttempts[ip]
+	if !exists {
+		return false
+	}
+
+	// 如果失败次数达到3次且在5分钟封禁期内
+	if attempt.Count >= 3 && time.Since(attempt.FirstTime) < 5*time.Minute {
+		return true
+	}
+
+	return false
+}
+
+// AddFailedAttempt 增加失败尝试次数
+func (al *AuthLimiter) AddFailedAttempt(ip string) {
+	al.mutex.Lock()
+	defer al.mutex.Unlock()
+
+	attempt, exists := al.failedAttempts[ip]
+	if !exists {
+		// 第一次失败
+		al.failedAttempts[ip] = &FailedAttempt{
+			Count:     1,
+			FirstTime: time.Now(),
+		}
+	} else {
+		// 如果超过1分钟，重置计数器
+		if time.Since(attempt.FirstTime) > 1*time.Minute {
+			attempt.Count = 1
+			attempt.FirstTime = time.Now()
+		} else {
+			// 增加失败次数
+			attempt.Count++
+		}
+	}
+}
+
+// ResetFailedAttempts 重置失败尝试次数
+func (al *AuthLimiter) ResetFailedAttempts(ip string) {
+	al.mutex.Lock()
+	defer al.mutex.Unlock()
+
+	delete(al.failedAttempts, ip)
+}
+
+// authMiddleware HTTP请求TOKEN验证中间件（带限流功能）
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 获取请求头中的TOKEN
-		token := c.GetHeader("Token")
+		clientIP := c.ClientIP()
 
+		if authLimiter.IsBlocked(clientIP) {
+			c.JSON(http.StatusTooManyRequests, NewCustomErrorResponse(ErrCodeInvalidTokenFailedTooMany, "认证失败次数过多，IP已被封禁"))
+			c.Abort()
+			return
+		}
+
+		token := c.GetHeader("Token")
 		if token == "" {
-			resp := NewErrorResponse(ErrCodeMissingToken)
-			c.JSON(http.StatusUnauthorized, resp)
+			//authLimiter.AddFailedAttempt(clientIP)
+			c.JSON(http.StatusUnauthorized, NewErrorResponse(ErrCodeMissingToken))
 			c.Abort()
 			return
 		}
@@ -2447,11 +2340,13 @@ func authMiddleware() gin.HandlerFunc {
 		configMutex.RUnlock()
 
 		if token != expectedToken {
-			resp := NewErrorResponse(ErrCodeInvalidToken)
-			c.JSON(http.StatusUnauthorized, resp)
+			authLimiter.AddFailedAttempt(clientIP)
+			c.JSON(http.StatusUnauthorized, NewErrorResponse(ErrCodeInvalidToken))
 			c.Abort()
 			return
 		}
+
+		authLimiter.ResetFailedAttempts(clientIP)
 
 		c.Next()
 	}
@@ -2460,20 +2355,17 @@ func authMiddleware() gin.HandlerFunc {
 // SignatureMiddleware 签名验证中间件
 func signatureMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 获取请求头中的时间戳和签名
 		timestamp := c.GetHeader("Timestamp")
 		signature := c.GetHeader("Signature")
 
 		if timestamp == "" {
-			resp := NewErrorResponse(ErrCodeMissingTimestamp)
-			c.JSON(http.StatusBadRequest, resp)
+			c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingTimestamp))
 			c.Abort()
 			return
 		}
 
 		if signature == "" {
-			resp := NewErrorResponse(ErrCodeMissingSignature)
-			c.JSON(http.StatusBadRequest, resp)
+			c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingSignature))
 			c.Abort()
 			return
 		}
@@ -2481,25 +2373,22 @@ func signatureMiddleware() gin.HandlerFunc {
 		// 验证时间戳格式
 		ts, err := strconv.ParseInt(timestamp, 10, 64)
 		if err != nil {
-			resp := NewErrorResponse(ErrCodeInvalidTimestamp)
-			c.JSON(http.StatusBadRequest, resp)
+			c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidTimestamp))
 			c.Abort()
 			return
 		}
 
 		// 检查时间戳是否过期（允许1分钟的时间差）
 		currentTime := time.Now().UnixMilli()
-		if abs(currentTime-ts) > 60*1000 {
-			resp := NewErrorResponse(ErrCodeTimestampExpired)
-			c.JSON(http.StatusBadRequest, resp)
+		if absValue(currentTime-ts) > 60*1000 {
+			c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeTimestampExpired))
 			c.Abort()
 			return
 		}
 
 		body, err := c.GetRawData()
 		if err != nil {
-			resp := NewErrorResponse(ErrCodeReadBodyFailed)
-			c.JSON(http.StatusBadRequest, resp)
+			c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeReadBodyFailed))
 			return
 		}
 
@@ -2508,22 +2397,13 @@ func signatureMiddleware() gin.HandlerFunc {
 		configMutex.RUnlock()
 
 		if !verifySignature(string(body), timestamp, token, signature) {
-			resp := NewErrorResponse(ErrCodeInvalidSignature)
-			c.JSON(http.StatusUnauthorized, resp)
+			c.JSON(http.StatusUnauthorized, NewErrorResponse(ErrCodeInvalidSignature))
 			c.Abort()
 			return
 		}
 
 		c.Next()
 	}
-}
-
-// abs 返回绝对值
-func abs(x int64) int64 {
-	if x < 0 {
-		return -x
-	}
-	return x
 }
 
 // 主函数
@@ -2545,10 +2425,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	// 保存配置文件路径
 	configPath = *configPathFlag
-
-	// 加载配置文件
 	if err := loadConfig(configPath); err != nil {
 		slog.Error("加载配置文件失败: %v", err)
 		os.Exit(1)
@@ -2617,6 +2494,7 @@ func main() {
 		api.Use(signatureMiddleware())
 	} else {
 		fmt.Println("当前运行模式：普通模式（Token验证）")
+		authLimiter = NewAuthLimiter()
 		api.Use(authMiddleware())
 	}
 	{
@@ -2624,25 +2502,22 @@ func main() {
 		api.POST("/sendToClient", sendToClientHandler)
 		api.POST("/closeClient", closeClientHandler)
 		api.GET("/isOnline", isClientOnlineHandler)
+		api.GET("/getSession", getClientSessionHandler)
+		api.POST("/setSession", setClientSessionHandler)
+		api.GET("/getAllClientIdCount", getAllClientIdCountHandler)
+		api.GET("/getAllClientCount", getAllClientIdCountHandler) // 别名，功能同 getAllClientIdCount
+		api.GET("/getAllClientIdList", getAllClientIdListHandler)
+		api.GET("/getAllClientSessions", getAllClientSessionsHandler)
+
+		// 用户管理接口
 		api.POST("/bindUid", bindUidHandler)
 		api.POST("/unbindUid", unbindUidHandler)
 		api.GET("/isUidOnline", isUidOnlineHandler)
 		api.POST("/sendToUid", sendToUidHandler)
-		api.GET("/getUidSession", getUidSessionHandler)        // 【GatewayWorker无此接口】
-		api.POST("/setUidSession", setUidSessionHandler)       // 【GatewayWorker无此接口】
-		api.GET("/getClientSession", getClientSessionHandler)  // 别名，功能同 getSession
-		api.POST("/setClientSession", setClientSessionHandler) // 别名，功能同 setSession
-		api.GET("/getSession", getClientSessionHandler)
-		api.POST("/setSession", setClientSessionHandler)
-		api.POST("/rpc", rpcHandler) // 【GatewayWorker无此接口】
 		api.GET("/getClientIdByUid", getClientIdByUidHandler)
 		api.GET("/getUidByClientId", getUidByClientIdHandler)
-		api.GET("/getAllUidCount", getAllUidCountHandler)
-		api.GET("/getAllClientIdCount", getAllClientCountHandler)
-		api.GET("/getAllClientCount", getAllClientCountHandler) // 别名，功能同 getAllClientIdCount
-		api.GET("/getAllClientIdList", getAllClientIdListHandler)
 		api.GET("/getAllUidList", getAllUidListHandler)
-		api.GET("/getAllClientSessions", getAllClientSessionsHandler)
+		api.GET("/getAllUidCount", getAllUidCountHandler)
 
 		// 群组管理接口
 		api.POST("/joinGroup", joinGroupHandler)
@@ -2656,6 +2531,11 @@ func main() {
 		api.GET("/getUidCountByGroup", getUidCountByGroupHandler)
 		api.GET("/getAllGroupIdList", getAllGroupIdListHandler)
 		api.GET("/getGroupByUid", getGroupByUidHandler) // 【GatewayWorker无此接口】
+
+		// GatewayWorker无此接口
+		api.GET("/getUidSession", getUidSessionHandler)  // 【GatewayWorker无此接口】
+		api.POST("/setUidSession", setUidSessionHandler) // 【GatewayWorker无此接口】
+		api.POST("/rpc", rpcHandler)                     // 【GatewayWorker无此接口】
 
 		// 配置热更新接口
 		api.POST("/reloadConfig", reloadConfigHandler) // 【GatewayWorker无此接口】
