@@ -864,6 +864,103 @@ func (h *Hub) sendToUid(uid string, body []byte) ResponseInfo {
 	}
 }
 
+// handleRPCResponse 处理来自客户端的RPC响应
+func (h *Hub) handleRPCResponse(uid string, response map[string]interface{}) {
+	id, hasID := response["_id"]
+	method, hasMethod := response["_method"]
+
+	if hasID && hasMethod {
+		var idStr string
+		switch v := id.(type) {
+		case uint64:
+			idStr = strconv.FormatUint(v, 10)
+		case uint32:
+			idStr = strconv.FormatUint(uint64(v), 10)
+		case int64:
+			idStr = strconv.FormatInt(v, 10)
+		case int32:
+			idStr = strconv.FormatInt(int64(v), 10)
+		case int:
+			idStr = strconv.Itoa(v)
+		case float64:
+			idStr = strconv.FormatInt(int64(v), 10)
+		case string:
+			idStr = v
+		default:
+			idStr = fmt.Sprintf("%v", v)
+		}
+
+		// RCP等待通道，唯一key：uid + _id + _method
+		rpcKey := fmt.Sprintf("%s_%s_%s", uid, idStr, method)
+
+		h.rpcMutex.RLock()
+		rpcChan, ok := h.rpcCalls[rpcKey]
+		h.rpcMutex.RUnlock()
+
+		if ok {
+			// 发送响应到等待的RPC调用
+			select {
+			case rpcChan <- response:
+			default:
+				// 通道已满或关闭
+			}
+		}
+	}
+}
+
+// callRPC 发起RPC调用并等待响应
+func (h *Hub) callRPC(uid string, body []byte, req *RPCRequest) ResponseInfo {
+	h.uidMapMutex.RLock()
+	clientIDs, ok := h.uidMap[uid]
+	h.uidMapMutex.RUnlock()
+	if !ok || len(clientIDs) == 0 {
+		return NewErrorResponse(ErrCodeUIDNotOnline)
+	}
+
+	// RCP等待通道，唯一key：uid + _id + _method
+	rpcKey := fmt.Sprintf("%s_%d_%s", uid, req.ID, req.Method)
+	rpcChan := make(chan interface{}, 1)
+
+	h.rpcMutex.Lock()
+	h.rpcCalls[rpcKey] = rpcChan
+	h.rpcMutex.Unlock()
+
+	defer func() {
+		h.rpcMutex.Lock()
+		delete(h.rpcCalls, rpcKey)
+		h.rpcMutex.Unlock()
+	}()
+
+	sent := false
+	h.clientsMutex.RLock()
+	for _, clientID := range clientIDs {
+		client, clientExists := h.clients[clientID]
+		if !clientExists {
+			continue
+		}
+
+		select {
+		case client.Send <- body:
+			sent = true
+		default:
+			// 发送失败，可能是通道已满或连接已关闭
+		}
+	}
+	h.clientsMutex.RUnlock()
+
+	if !sent {
+		return NewErrorResponse(ErrCodeUnableToSendRPC)
+	}
+
+	// 等待响应或超时
+	select {
+	case result := <-rpcChan:
+		return NewSuccessResponse(result)
+	case <-time.After(10 * time.Second):
+		return NewErrorResponse(ErrCodeRPCTimeout)
+	}
+}
+
 // joinGroup 将客户端加入群组
 func (h *Hub) joinGroup(groupName, clientID string) ResponseInfo {
 	h.clientsMutex.RLock()
@@ -988,103 +1085,6 @@ func (h *Hub) sendToGroup(req SendToGroupRequest) ResponseInfo {
 	}
 
 	return NewSuccessResponse(sendToClients(targetClients, req.Data))
-}
-
-// handleRPCResponse 处理来自客户端的RPC响应
-func (h *Hub) handleRPCResponse(uid string, response map[string]interface{}) {
-	id, hasID := response["_id"]
-	method, hasMethod := response["_method"]
-
-	if hasID && hasMethod {
-		var idStr string
-		switch v := id.(type) {
-		case uint64:
-			idStr = strconv.FormatUint(v, 10)
-		case uint32:
-			idStr = strconv.FormatUint(uint64(v), 10)
-		case int64:
-			idStr = strconv.FormatInt(v, 10)
-		case int32:
-			idStr = strconv.FormatInt(int64(v), 10)
-		case int:
-			idStr = strconv.Itoa(v)
-		case float64:
-			idStr = strconv.FormatInt(int64(v), 10)
-		case string:
-			idStr = v
-		default:
-			idStr = fmt.Sprintf("%v", v)
-		}
-
-		// RCP等待通道，唯一key：uid + _id + _method
-		rpcKey := fmt.Sprintf("%s_%s_%s", uid, idStr, method)
-
-		h.rpcMutex.RLock()
-		rpcChan, ok := h.rpcCalls[rpcKey]
-		h.rpcMutex.RUnlock()
-
-		if ok {
-			// 发送响应到等待的RPC调用
-			select {
-			case rpcChan <- response:
-			default:
-				// 通道已满或关闭
-			}
-		}
-	}
-}
-
-// callRPC 发起RPC调用并等待响应
-func (h *Hub) callRPC(uid string, body []byte, req *RPCRequest) ResponseInfo {
-	h.uidMapMutex.RLock()
-	clientIDs, ok := h.uidMap[uid]
-	h.uidMapMutex.RUnlock()
-	if !ok || len(clientIDs) == 0 {
-		return NewErrorResponse(ErrCodeUIDNotOnline)
-	}
-
-	// RCP等待通道，唯一key：uid + _id + _method
-	rpcKey := fmt.Sprintf("%s_%d_%s", uid, req.ID, req.Method)
-	rpcChan := make(chan interface{}, 1)
-
-	h.rpcMutex.Lock()
-	h.rpcCalls[rpcKey] = rpcChan
-	h.rpcMutex.Unlock()
-
-	defer func() {
-		h.rpcMutex.Lock()
-		delete(h.rpcCalls, rpcKey)
-		h.rpcMutex.Unlock()
-	}()
-
-	sent := false
-	h.clientsMutex.RLock()
-	for _, clientID := range clientIDs {
-		client, clientExists := h.clients[clientID]
-		if !clientExists {
-			continue
-		}
-
-		select {
-		case client.Send <- body:
-			sent = true
-		default:
-			// 发送失败，可能是通道已满或连接已关闭
-		}
-	}
-	h.clientsMutex.RUnlock()
-
-	if !sent {
-		return NewErrorResponse(ErrCodeUnableToSendRPC)
-	}
-
-	// 等待响应或超时
-	select {
-	case result := <-rpcChan:
-		return NewSuccessResponse(result)
-	case <-time.After(10 * time.Second):
-		return NewErrorResponse(ErrCodeRPCTimeout)
-	}
 }
 
 // sendToClients 向指定客户端列表发送消息并返回成功和失败数量
@@ -1743,6 +1743,103 @@ func getAllUidCountHandler(c *gin.Context) {
 	}))
 }
 
+// HTTP处理函数，获取UID的session
+func getUidSessionHandler(c *gin.Context) {
+	uid := c.Query("uid")
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
+		return
+	}
+
+	hub.uidMapMutex.RLock()
+	clientIDs, ok := hub.uidMap[uid]
+	hub.uidMapMutex.RUnlock()
+	if !ok || len(clientIDs) == 0 {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeUIDNotOnline))
+		return
+	}
+
+	hub.sessionsMutex.RLock()
+	session, ok := hub.sessions[uid]
+	hub.sessionsMutex.RUnlock()
+	if ok {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"session": session,
+		}))
+	} else {
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+			"session": nil,
+		}))
+	}
+}
+
+// HTTP处理函数，设置UID的session
+func setUidSessionHandler(c *gin.Context) {
+	uid := c.Query("uid")
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
+		return
+	}
+
+	var session map[string]interface{}
+	if err := c.ShouldBindJSON(&session); err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
+		return
+	}
+
+	hub.uidMapMutex.RLock()
+	defer hub.uidMapMutex.RUnlock()
+	clientIDs, ok := hub.uidMap[uid]
+	if !ok || len(clientIDs) == 0 {
+		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeUIDNotOnline))
+		return
+	}
+
+	hub.sessionsMutex.Lock()
+	hub.sessions[uid] = session
+	hub.sessionsMutex.Unlock()
+
+	c.JSON(http.StatusOK, NewSuccessResponse(nil))
+}
+
+// HTTP处理函数，RPC调用接口
+func rpcHandler(c *gin.Context) {
+	uid := c.GetHeader("uid")
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUIDHeader))
+		return
+	}
+
+	body, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeReadBodyFailed))
+		return
+	}
+
+	if len(body) == 0 {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeEmptyBody))
+		return
+	}
+
+	req := &RPCRequest{}
+	if err := json.Unmarshal(body, req); err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
+		return
+	}
+
+	if req.ID == 0 {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingID))
+		return
+	}
+
+	if req.Method == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingMethod))
+		return
+	}
+
+	c.JSON(http.StatusOK, hub.callRPC(uid, body, req))
+}
+
 // HTTP处理函数，将客户端加入群组
 func joinGroupHandler(c *gin.Context) {
 	var req GroupRequest
@@ -2094,103 +2191,6 @@ func getGroupByUidHandler(c *gin.Context) {
 	}
 }
 
-// HTTP处理函数，获取UID的session
-func getUidSessionHandler(c *gin.Context) {
-	uid := c.Query("uid")
-	if uid == "" {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
-		return
-	}
-
-	hub.uidMapMutex.RLock()
-	clientIDs, ok := hub.uidMap[uid]
-	hub.uidMapMutex.RUnlock()
-	if !ok || len(clientIDs) == 0 {
-		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeUIDNotOnline))
-		return
-	}
-
-	hub.sessionsMutex.RLock()
-	session, ok := hub.sessions[uid]
-	hub.sessionsMutex.RUnlock()
-	if ok {
-		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
-			"session": session,
-		}))
-	} else {
-		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
-			"session": nil,
-		}))
-	}
-}
-
-// HTTP处理函数，设置UID的session
-func setUidSessionHandler(c *gin.Context) {
-	uid := c.Query("uid")
-	if uid == "" {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
-		return
-	}
-
-	var session map[string]interface{}
-	if err := c.ShouldBindJSON(&session); err != nil {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
-		return
-	}
-
-	hub.uidMapMutex.RLock()
-	defer hub.uidMapMutex.RUnlock()
-	clientIDs, ok := hub.uidMap[uid]
-	if !ok || len(clientIDs) == 0 {
-		c.JSON(http.StatusOK, NewErrorResponse(ErrCodeUIDNotOnline))
-		return
-	}
-
-	hub.sessionsMutex.Lock()
-	hub.sessions[uid] = session
-	hub.sessionsMutex.Unlock()
-
-	c.JSON(http.StatusOK, NewSuccessResponse(nil))
-}
-
-// HTTP处理函数，RPC调用接口
-func rpcHandler(c *gin.Context) {
-	uid := c.GetHeader("uid")
-	if uid == "" {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUIDHeader))
-		return
-	}
-
-	body, err := c.GetRawData()
-	if err != nil {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeReadBodyFailed))
-		return
-	}
-
-	if len(body) == 0 {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeEmptyBody))
-		return
-	}
-
-	req := &RPCRequest{}
-	if err := json.Unmarshal(body, req); err != nil {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
-		return
-	}
-
-	if req.ID == 0 {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingID))
-		return
-	}
-
-	if req.Method == "" {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingMethod))
-		return
-	}
-
-	c.JSON(http.StatusOK, hub.callRPC(uid, body, req))
-}
-
 // HTTP处理函数，重新加载配置
 func reloadConfigHandler(c *gin.Context) {
 	configMutex.RLock()
@@ -2518,6 +2518,9 @@ func main() {
 		api.GET("/getUidByClientId", getUidByClientIdHandler)
 		api.GET("/getAllUidList", getAllUidListHandler)
 		api.GET("/getAllUidCount", getAllUidCountHandler)
+		api.GET("/getUidSession", getUidSessionHandler)  // 【GatewayWorker无此接口】
+		api.POST("/setUidSession", setUidSessionHandler) // 【GatewayWorker无此接口】
+		api.POST("/rpc", rpcHandler)                     // 【GatewayWorker无此接口】
 
 		// 群组管理接口
 		api.POST("/joinGroup", joinGroupHandler)
@@ -2531,11 +2534,6 @@ func main() {
 		api.GET("/getUidCountByGroup", getUidCountByGroupHandler)
 		api.GET("/getAllGroupIdList", getAllGroupIdListHandler)
 		api.GET("/getGroupByUid", getGroupByUidHandler) // 【GatewayWorker无此接口】
-
-		// GatewayWorker无此接口
-		api.GET("/getUidSession", getUidSessionHandler)  // 【GatewayWorker无此接口】
-		api.POST("/setUidSession", setUidSessionHandler) // 【GatewayWorker无此接口】
-		api.POST("/rpc", rpcHandler)                     // 【GatewayWorker无此接口】
 
 		// 配置热更新接口
 		api.POST("/reloadConfig", reloadConfigHandler) // 【GatewayWorker无此接口】
