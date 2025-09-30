@@ -1381,7 +1381,7 @@ func sendToAllHandler(c *gin.Context) {
 	}
 
 	if req.Data == "" {
-		c.JSON(http.StatusBadRequest, NewCustomErrorResponse(ErrCodeInvalidParams, "缺少data参数"))
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingData))
 		return
 	}
 
