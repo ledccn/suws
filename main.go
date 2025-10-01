@@ -558,22 +558,16 @@ func (c *Client) writePump() {
 				return
 			}
 
-			err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err != nil {
+			if err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
 				return
 			}
-			if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				// 明确处理超时和其他写入错误
-				slog.Debug(fmt.Sprintf("客户端 %s 写入超时: %v", c.ID, err))
+			if e := c.Conn.WriteMessage(websocket.TextMessage, message); e != nil {
+				slog.Debug(fmt.Sprintf("客户端 %s 写入超时: %v", c.ID, e))
 				return
 			}
 		case <-ticker.C:
-			err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err != nil {
-				return
-			}
 			// 服务端向客户端发送 Ping 帧
-			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := c.Conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
 				slog.Debug(fmt.Sprintf("客户端 %s Ping超时: %v", c.ID, err))
 				return
 			}
@@ -590,12 +584,19 @@ func (c *Client) readPump() {
 	// 1. 限制消息大小
 	c.Conn.SetReadLimit(262144) // 512KB（524288） 或 256KB（262144） 或 128KB（131072）
 	// 2. 设置读取超时
-	err := c.Conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-	if err != nil {
+	if err := c.Conn.SetReadDeadline(time.Now().Add(90 * time.Second)); err != nil {
 		return
 	}
 	// 3. 服务端收到 Pong 帧后，触发 PongHandler
 	c.Conn.SetPongHandler(func(string) error {
+		return c.updateLastPing()
+	})
+	// 4. 服务端收到 Ping 帧后，回复 Pong 帧
+	c.Conn.SetPingHandler(func(string) error {
+		if e := c.Conn.WriteControl(websocket.PongMessage, nil, time.Now().Add(10*time.Second)); e != nil {
+			return e
+		}
+
 		return c.updateLastPing()
 	})
 
@@ -611,8 +612,7 @@ func (c *Client) readPump() {
 		msg := string(message)
 		// 处理心跳包
 		if msg == WebhookEventPing {
-			err := c.updateLastPing()
-			if err != nil {
+			if e := c.updateLastPing(); e != nil {
 				break
 			}
 
@@ -623,7 +623,7 @@ func (c *Client) readPump() {
 		// 处理RPC响应
 		if c.UID != "" {
 			var rpcResp map[string]interface{}
-			if err := json.Unmarshal(message, &rpcResp); err == nil {
+			if e := json.Unmarshal(message, &rpcResp); e == nil {
 				_, hasID := rpcResp["_id"]
 				_, hasMethod := rpcResp["_method"]
 				if hasID && hasMethod {
@@ -645,8 +645,7 @@ func (c *Client) updateLastPing() error {
 	c.LastPing = time.Now()
 	c.mutex.Unlock()
 
-	err := c.Conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-	if err != nil {
+	if err := c.Conn.SetReadDeadline(time.Now().Add(90 * time.Second)); err != nil {
 		return err
 	}
 
