@@ -1839,6 +1839,44 @@ func rpcHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, hub.callRPC(uid, body, req))
 }
 
+// HTTP处理函数，RPC调用接口
+func rpcPutHandler(c *gin.Context) {
+	uid := c.Param("uid")
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
+		return
+	}
+
+	body, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeReadBodyFailed))
+		return
+	}
+
+	if len(body) == 0 {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeEmptyBody))
+		return
+	}
+
+	req := &RPCRequest{}
+	if err := json.Unmarshal(body, req); err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
+		return
+	}
+
+	if req.ID == 0 {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingID))
+		return
+	}
+
+	if req.Method == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingMethod))
+		return
+	}
+
+	c.JSON(http.StatusOK, hub.callRPC(uid, body, req))
+}
+
 // HTTP处理函数，将客户端加入群组
 func joinGroupHandler(c *gin.Context) {
 	var req GroupRequest
@@ -2520,6 +2558,7 @@ func main() {
 		api.GET("/getUidSession", getUidSessionHandler)  // 【GatewayWorker无此接口】
 		api.POST("/setUidSession", setUidSessionHandler) // 【GatewayWorker无此接口】
 		api.POST("/rpc", rpcHandler)                     // 【GatewayWorker无此接口】
+		api.PUT("/rpc/:uid", rpcPutHandler)              // 【GatewayWorker无此接口】
 
 		// 群组管理接口
 		api.POST("/joinGroup", joinGroupHandler)
@@ -2527,6 +2566,7 @@ func main() {
 		api.POST("/ungroup", ungroupHandler)
 		api.POST("/sendToGroup", sendToGroupHandler)
 		api.GET("/getClientIdCountByGroup", getClientIdCountByGroupHandler)
+		api.GET("/getClientCountByGroup", getClientIdCountByGroupHandler) // 别名，功能同 getClientIdCountByGroup
 		api.GET("/getClientSessionsByGroup", getClientSessionsByGroupHandler)
 		api.GET("/getClientIdListByGroup", getClientIdListByGroupHandler)
 		api.GET("/getUidListByGroup", getUidListByGroupHandler)
