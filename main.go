@@ -1840,7 +1840,7 @@ func rpcHandler(c *gin.Context) {
 }
 
 // HTTP处理函数，RPC调用接口
-func rpcPutHandler(c *gin.Context) {
+func rpcUidHandler(c *gin.Context) {
 	uid := c.Param("uid")
 	if uid == "" {
 		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
@@ -2558,7 +2558,8 @@ func main() {
 		api.GET("/getUidSession", getUidSessionHandler)  // 【GatewayWorker无此接口】
 		api.POST("/setUidSession", setUidSessionHandler) // 【GatewayWorker无此接口】
 		api.POST("/rpc", rpcHandler)                     // 【GatewayWorker无此接口】
-		api.PUT("/rpc/:uid", rpcPutHandler)              // 【GatewayWorker无此接口】
+		api.POST("/rpc/:uid", rpcUidHandler)             // 【GatewayWorker无此接口】
+		api.PUT("/rpc/:uid", rpcUidHandler)              // 【GatewayWorker无此接口】
 
 		// 群组管理接口
 		api.POST("/joinGroup", joinGroupHandler)
