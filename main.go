@@ -2559,7 +2559,6 @@ func main() {
 		api.POST("/setUidSession", setUidSessionHandler) // 【GatewayWorker无此接口】
 		api.POST("/rpc", rpcHandler)                     // 【GatewayWorker无此接口】
 		api.POST("/rpc/:uid", rpcUidHandler)             // 【GatewayWorker无此接口】
-		api.PUT("/rpc/:uid", rpcUidHandler)              // 【GatewayWorker无此接口】
 
 		// 群组管理接口
 		api.POST("/joinGroup", joinGroupHandler)
