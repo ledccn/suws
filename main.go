@@ -587,11 +587,11 @@ func (c *Client) readPump() {
 	if err := c.Conn.SetReadDeadline(time.Now().Add(90 * time.Second)); err != nil {
 		return
 	}
-	// 3. 服务端收到 Pong 帧后，触发 PongHandler
+	// 3. 服务端收到 Pong 帧后，更新最后ping时间
 	c.Conn.SetPongHandler(func(string) error {
 		return c.updateLastPing()
 	})
-	// 4. 服务端收到 Ping 帧后，回复 Pong 帧
+	// 4. 服务端收到 Ping 帧后，回复 Pong 帧，更新最后ping时间
 	c.Conn.SetPingHandler(func(string) error {
 		if e := c.Conn.WriteControl(websocket.PongMessage, nil, time.Now().Add(10*time.Second)); e != nil {
 			return e
