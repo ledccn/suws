@@ -570,7 +570,7 @@ func (c *Client) writePump() {
 		case <-ticker.C:
 			// 服务端向客户端发送 Ping 帧
 			if err := c.Conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
-				slog.Debug(fmt.Sprintf("客户端 %s Ping超时: %v", c.ID, err))
+				slog.Debug(fmt.Sprintf("向客户端 %s 发送Ping帧超时: %v", c.ID, err))
 				return
 			}
 		}
@@ -592,12 +592,13 @@ func (c *Client) readPump() {
 	}
 	// 3. 服务端收到 Pong 帧后，更新最后ping时间
 	c.Conn.SetPongHandler(func(string) error {
+		slog.Debug(fmt.Sprintf("收到客户端 %s 响应的Pong帧", c.ID))
 		return c.updateLastPing()
 	})
 	// 4. 服务端收到 Ping 帧后，回复 Pong 帧，更新最后ping时间
 	c.Conn.SetPingHandler(func(string) error {
 		if e := c.Conn.WriteControl(websocket.PongMessage, nil, time.Now().Add(10*time.Second)); e != nil {
-			slog.Debug(fmt.Sprintf("客户端 %s 回复Pong帧异常: %v", c.ID, e))
+			slog.Debug(fmt.Sprintf("向客户端 %s 发送Pong帧异常: %v", c.ID, e))
 			return e
 		}
 
