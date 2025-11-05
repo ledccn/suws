@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -2452,10 +2453,21 @@ func signatureMiddleware() gin.HandlerFunc {
 	}
 }
 
+// 获取当前可执行文件的目录路径
+func getExecutableDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	return filepath.Dir(exe)
+}
+
 // 主函数
 func main() {
+	// 获取可执行文件同目录下的 config.json 作为默认配置文件路径
+	defaultConfigPath := filepath.Join(getExecutableDir(), "config.json")
 	var (
-		configPathFlag = flag.String("c", "config.json", "配置文件路径")
+		configPathFlag = flag.String("c", defaultConfigPath, "配置文件路径")
 		showVersion    = flag.Bool("v", false, "显示版本信息")
 	)
 	var secureMode bool // 安全模式标志
