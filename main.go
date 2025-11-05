@@ -587,6 +587,7 @@ func (c *Client) readPump() {
 	c.Conn.SetReadLimit(262144) // 512KB（524288） 或 256KB（262144） 或 128KB（131072）
 	// 2. 设置读取超时
 	if err := c.Conn.SetReadDeadline(time.Now().Add(90 * time.Second)); err != nil {
+		slog.Debug(fmt.Sprintf("设置客户端 %s 读取超时异常: %v", c.ID, err))
 		return
 	}
 	// 3. 服务端收到 Pong 帧后，更新最后ping时间
@@ -596,6 +597,7 @@ func (c *Client) readPump() {
 	// 4. 服务端收到 Ping 帧后，回复 Pong 帧，更新最后ping时间
 	c.Conn.SetPingHandler(func(string) error {
 		if e := c.Conn.WriteControl(websocket.PongMessage, nil, time.Now().Add(10*time.Second)); e != nil {
+			slog.Debug(fmt.Sprintf("客户端 %s 回复Pong帧异常: %v", c.ID, e))
 			return e
 		}
 
@@ -648,6 +650,7 @@ func (c *Client) updateLastPing() error {
 	c.mutex.Unlock()
 
 	if err := c.Conn.SetReadDeadline(time.Now().Add(90 * time.Second)); err != nil {
+		slog.Debug(fmt.Sprintf("设置客户端 %s 读取超时异常: %v", c.ID, err))
 		return err
 	}
 
