@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -2245,21 +2246,29 @@ func reloadConfigHandler(c *gin.Context) {
 		return
 	}
 
-	// 更新webhook HTTP客户端配置
+	// 初始化带连接池的 webhook HTTP 客户端
+	webhookHTTPClient = createWebhookHTTPClient()
+
+	resp := NewSuccessResponseWithMessage("配置重载成功", nil)
+	c.JSON(http.StatusOK, resp)
+}
+
+// createWebhookHTTPClient 创建webhook HTTP客户端
+func createWebhookHTTPClient() *http.Client {
 	configMutex.RLock()
+	defer configMutex.RUnlock()
+
 	transport := &http.Transport{
 		MaxIdleConns:        config.WebhookMaxIdleConns,
 		MaxIdleConnsPerHost: config.WebhookMaxIdleConnsPerHost,
 		IdleConnTimeout:     time.Duration(config.WebhookIdleConnTimeout) * time.Second,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, // 跳过证书验证
 	}
-	webhookHTTPClient = &http.Client{
+
+	return &http.Client{
 		Transport: transport,
 		Timeout:   time.Duration(config.WebhookTimeout) * time.Second,
 	}
-	configMutex.RUnlock()
-
-	resp := NewSuccessResponseWithMessage("配置重载成功", nil)
-	c.JSON(http.StatusOK, resp)
 }
 
 // HTTP处理函数，获取当前配置
@@ -2489,15 +2498,7 @@ func main() {
 	slog.SetDefault(logger)
 
 	// 初始化带连接池的 webhook HTTP 客户端
-	transport := &http.Transport{
-		MaxIdleConns:        config.WebhookMaxIdleConns,
-		MaxIdleConnsPerHost: config.WebhookMaxIdleConnsPerHost,
-		IdleConnTimeout:     time.Duration(config.WebhookIdleConnTimeout) * time.Second,
-	}
-	webhookHTTPClient = &http.Client{
-		Transport: transport,
-		Timeout:   time.Duration(config.WebhookTimeout) * time.Second,
-	}
+	webhookHTTPClient = createWebhookHTTPClient()
 
 	// 初始化hub
 	hub = newHub()
