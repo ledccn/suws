@@ -1848,44 +1848,6 @@ func rpcHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, hub.callRPC(uid, body, req))
 }
 
-// HTTP处理函数，RPC调用接口
-func rpcUidHandler(c *gin.Context) {
-	uid := c.Param("uid")
-	if uid == "" {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingUID))
-		return
-	}
-
-	body, err := c.GetRawData()
-	if err != nil {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeReadBodyFailed))
-		return
-	}
-
-	if len(body) == 0 {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeEmptyBody))
-		return
-	}
-
-	req := &RPCRequest{}
-	if err := json.Unmarshal(body, req); err != nil {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeInvalidParams))
-		return
-	}
-
-	if req.ID == 0 {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingID))
-		return
-	}
-
-	if req.Method == "" {
-		c.JSON(http.StatusBadRequest, NewErrorResponse(ErrCodeMissingMethod))
-		return
-	}
-
-	c.JSON(http.StatusOK, hub.callRPC(uid, body, req))
-}
-
 // HTTP处理函数，将客户端加入群组
 func joinGroupHandler(c *gin.Context) {
 	var req GroupRequest
@@ -2482,7 +2444,7 @@ func main() {
 	flag.Parse()
 
 	startTime = time.Now() // 记录启动时间
-	fmt.Printf("suws.cn WebSocket Server\n")
+	fmt.Println("WebSocket Server suws.cn")
 	fmt.Printf("Version:    %s\n", Version)
 	fmt.Printf("Commit:     %s\n", Commit)
 	fmt.Printf("Build Time: %s\n", BuildTime)
@@ -2578,7 +2540,6 @@ func main() {
 		api.GET("/getUidSession", getUidSessionHandler)  // 【GatewayWorker无此接口】
 		api.POST("/setUidSession", setUidSessionHandler) // 【GatewayWorker无此接口】
 		api.POST("/rpc", rpcHandler)                     // 【GatewayWorker无此接口】
-		api.POST("/rpc/:uid", rpcUidHandler)             // 【GatewayWorker无此接口】
 
 		// 群组管理接口
 		api.POST("/joinGroup", joinGroupHandler)
