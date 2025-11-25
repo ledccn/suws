@@ -331,13 +331,13 @@ func loadConfig(configPath string) error {
 		c.WebhookTimeout = 5
 	}
 	if c.WebhookMaxIdleConns == 0 {
-		c.WebhookMaxIdleConns = 100
+		c.WebhookMaxIdleConns = 50
 	}
 	if c.WebhookMaxIdleConnsPerHost == 0 {
 		c.WebhookMaxIdleConnsPerHost = 5
 	}
 	if c.WebhookIdleConnTimeout == 0 {
-		c.WebhookIdleConnTimeout = 90
+		c.WebhookIdleConnTimeout = 60
 	}
 	if c.Webhook != "" {
 		fmt.Println("WebHook已启用", c.Webhook)
