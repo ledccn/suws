@@ -509,7 +509,7 @@ func handleWebSocket(c *gin.Context) {
 
 	hub.register <- client
 
-	initMsg := map[string]interface{}{
+	initMsg := map[string]string{
 		"event":     "init",
 		"client_id": clientID,
 		"auth":      auth,
@@ -1096,7 +1096,7 @@ func (h *Hub) sendToGroup(req SendToGroupRequest) ResponseInfo {
 }
 
 // sendToClients 向指定客户端列表发送消息并返回成功和失败数量
-func sendToClients(targetClients map[string]*Client, data string) map[string]interface{} {
+func sendToClients(targetClients map[string]*Client, data string) map[string]int {
 	successCount := 0
 	failureCount := 0
 
@@ -1109,7 +1109,7 @@ func sendToClients(targetClients map[string]*Client, data string) map[string]int
 		}
 	}
 
-	return map[string]interface{}{
+	return map[string]int{
 		"success": successCount,
 		"failure": failureCount,
 	}
@@ -1250,7 +1250,7 @@ func absValue(x int64) int64 {
 
 // handleVersion 处理版本信息请求
 func handleVersion(c *gin.Context) {
-	versionInfo := map[string]interface{}{
+	versionInfo := map[string]string{
 		"version":    Version,
 		"commit":     Commit,
 		"build_time": BuildTime,
@@ -1453,7 +1453,7 @@ func isClientOnlineHandler(c *gin.Context) {
 	_, ok := hub.clients[clientID]
 	hub.clientsMutex.RUnlock()
 
-	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]bool{
 		"online": ok,
 	}))
 }
@@ -1518,7 +1518,7 @@ func getAllClientIdCountHandler(c *gin.Context) {
 	count := len(hub.clients)
 	hub.clientsMutex.RUnlock()
 
-	data := map[string]interface{}{
+	data := map[string]int{
 		"count": count,
 	}
 	resp := NewSuccessResponse(data)
@@ -1542,7 +1542,7 @@ func getAllClientIdListHandler(c *gin.Context) {
 		clientIDs = append(clientIDs, clientID)
 	}
 
-	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string][]string{
 		"client_ids": clientIDs,
 	}))
 }
@@ -1626,7 +1626,7 @@ func isUidOnlineHandler(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]bool{
 		"online": hub.isUidOnline(uid),
 	}))
 }
@@ -1678,7 +1678,7 @@ func getClientIdByUidHandler(c *gin.Context) {
 	}
 	hub.clientsMutex.RUnlock()
 
-	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string][]string{
 		"client_ids": onlineClientIDs,
 	}))
 }
@@ -1706,7 +1706,7 @@ func getUidByClientIdHandler(c *gin.Context) {
 			"uid": nil,
 		}))
 	} else {
-		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]string{
 			"uid": client.UID,
 		}))
 	}
@@ -1734,7 +1734,7 @@ func getAllUidListHandler(c *gin.Context) {
 			"uids": nil,
 		}))
 	} else {
-		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string][]string{
 			"uids": uids,
 		}))
 	}
@@ -1746,7 +1746,7 @@ func getAllUidCountHandler(c *gin.Context) {
 	onlineUidCount := len(hub.uidMap)
 	hub.uidMapMutex.RUnlock()
 
-	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]int{
 		"count": onlineUidCount,
 	}))
 }
@@ -1956,7 +1956,7 @@ func getClientIdCountByGroupHandler(c *gin.Context) {
 	}
 	hub.clientsMutex.RUnlock()
 
-	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]int{
 		"count": count,
 	}))
 }
@@ -2024,7 +2024,7 @@ func getClientIdListByGroupHandler(c *gin.Context) {
 			"clients": nil,
 		}))
 	} else {
-		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]map[string]int64{
 			"clients": clients,
 		}))
 	}
@@ -2071,7 +2071,7 @@ func getUidListByGroupHandler(c *gin.Context) {
 		uids = append(uids, uid)
 	}
 
-	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string][]string{
 		"uids": uids,
 	}))
 }
@@ -2105,7 +2105,7 @@ func getUidCountByGroupHandler(c *gin.Context) {
 	}
 	hub.clientsMutex.RUnlock()
 
-	c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+	c.JSON(http.StatusOK, NewSuccessResponse(map[string]int{
 		"count": len(uidSet),
 	}))
 }
@@ -2144,7 +2144,7 @@ func getAllGroupIdListHandler(c *gin.Context) {
 			"groups": nil,
 		}))
 	} else {
-		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string][]string{
 			"groups": groupNames,
 		}))
 	}
@@ -2193,7 +2193,7 @@ func getGroupByUidHandler(c *gin.Context) {
 			"groups": nil,
 		}))
 	} else {
-		c.JSON(http.StatusOK, NewSuccessResponse(map[string]interface{}{
+		c.JSON(http.StatusOK, NewSuccessResponse(map[string]map[string]map[string]int64{
 			"groups": groupInfo,
 		}))
 	}
